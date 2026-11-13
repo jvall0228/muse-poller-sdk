@@ -54,24 +54,42 @@
 #                       holder is presumed orphaned, e.g. 900 (used by the
 #                       worker's holder, documented here for the operator)
 #
+# Queue rotation: the worker may archive a fully consumed queue and reset
+# its cursor to 0 (rotate-queue.sh), holding an exclusive flock on
+# queue.lock in the queue's directory; daemons take the same lock around
+# every append. The hook therefore (a) takes a shared, NON-blocking flock on
+# that queue.lock while it reads the line count and the cursor, so it never
+# sees a half-rotated pair, and stays silent for this poll if the lock is
+# busy; and (b) treats cursor > line count as "queue was rotated" and uses
+# cursor 0. The hook never blocks and never writes the lock's contents.
+#
 # Register with: hooks.add, script path = this file, poll interval 60s,
 # prompt = templates/hook-prompt.md (filled in — do not shorten it; the
 # spawn-verification clause is load-bearing).
-# Dry-run all five states before enabling (see SKILL.md, "Dry-run note":
+# Dry-run all states before enabling (see SKILL.md, "Dry-run note":
 # state 2 needs the state file seeded with {"seen_absent": true} first,
-# and state 5 with a recent "woke_at", or test them live with hooks.run):
+# and state 5 with a recent "woke_at", or test them live with hooks.run;
+# tests/hook/run.sh exercises all of them against a stub runtime):
+#   0. flock missing        -> silent "flock not installed — ..."
 #   1. no queue file        -> silent "no queue file yet"
 #   2. file appears (new)   -> WAKE (never baseline a fresh file)
 #   3. no new lines         -> silent "no new <items>"
 #   4. worker alive (lock held) -> silent "worker alive (lock held)"
 #   5. woke recently, no lock yet -> silent "worker starting (woke Ns ago)"
+#   6. first look, file pre-existed -> silent "baseline at N lines"
+#   7. queue.lock busy (rotation/append in progress) -> silent "queue busy"
+#   8. cursor > lines (queue rotated) -> cursor treated as 0 (wakes if
+#      the new queue has lines and no worker is alive)
 set -euo pipefail
+# shellcheck source=/dev/null
 source "$HATCH_HOOK_RUNTIME"
 
 QUEUE="{{QUEUE}}"
+# shellcheck disable=SC2034  # ALIVE is documented/used by the worker side
 ALIVE="{{ALIVE}}"
 LOCKFILE="{{LOCKFILE}}"
 CURSOR="{{CURSOR}}"
+# shellcheck disable=SC1083  # template placeholder, filled before use
 STARTUP_WINDOW_SECS={{STARTUP_WINDOW_SECS}}
 
 state=$(hook_state_get 2>/dev/null \
@@ -100,6 +118,19 @@ if [ -e "$LOCKFILE" ] && ! flock -n "$LOCKFILE" -c true 2>/dev/null; then
     lock_held=1
 fi
 
+# Shared, non-blocking lock on queue.lock around the count+cursor read (see
+# "Queue rotation" above). If the lock cannot be opened (directory missing,
+# read-only) skip the lock rather than failing: rotation is optional.
+QUEUE_LOCK="$(dirname "$QUEUE")/queue.lock"
+have_qlock=0
+if [ -d "$(dirname "$QUEUE")" ] && ( : >> "$QUEUE_LOCK" ) 2>/dev/null; then
+    exec 8>> "$QUEUE_LOCK"
+    have_qlock=1
+    if ! flock -s -n 8; then
+        silent "queue busy (queue.lock held; rotation or append in progress)" '{}'
+    fi
+fi
+
 if [ ! -f "$QUEUE" ]; then
     # Record that we looked and the file was absent: if it appears later,
     # its lines are NEW work, not history — they must wake, not baseline.
@@ -111,7 +142,12 @@ fi
 lines=$(wc -l < "$QUEUE" | tr -d ' ')
 cursor=0
 [ -f "$CURSOR" ] && cursor=$(tr -d ' \n' < "$CURSOR" 2>/dev/null || echo 0)
-[ -n "$cursor" ] || cursor=0
+case $cursor in ''|*[!0-9]*) cursor=0 ;; esac
+# Done reading shared state: release the shared queue lock promptly.
+if [ "$have_qlock" -eq 1 ]; then exec 8>&-; fi
+# A cursor beyond the line count means the queue was rotated (or truncated)
+# and the cursor reset has not been observed: treat the cursor as 0.
+if [ "$cursor" -gt "$lines" ]; then cursor=0; fi
 
 # A worker is alive: stay silent WITHOUT touching anything, so that if the
 # worker dies before consuming the items, a later poll still wakes a

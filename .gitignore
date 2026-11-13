@@ -1,0 +1,9 @@
+# Local-only leak terms for scripts/check-leaks.sh (one per line)
+.leak-terms
+
+# Caches and dependencies
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+node_modules/

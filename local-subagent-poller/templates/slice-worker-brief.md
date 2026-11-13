@@ -31,6 +31,8 @@
                               review the existing material first — never act
                               from memory alone, never invent, never re-offer
                               a locked choice."
+     {{SCRIPTS_DIR}}        — absolute path to the directory holding
+                              rotate-queue.sh (copy it from templates/)
      {{STOP_FILE}}          — absolute path to the stop file
      {{OWNER_ID}}           — the owner's verified author id in the source
                               (never a display name)
@@ -44,7 +46,7 @@
      {{EXTRA_HARD_RULES}}   — source-specific hard rules; delete the line if none
 -->
 
-You are the {{SLICE_WORKER_TITLE}}. Consume {{QUEUE_PATH}} {{WORKER_POLL}} (track your position in {{CURSOR_PATH}}). You OWN {{SLICE}} — no other worker touches those.
+You are the {{SLICE_WORKER_TITLE}}. Consume {{QUEUE_PATH}} {{WORKER_POLL}} (track your position in {{CURSOR_PATH}}; if it is greater than the queue's line count the queue was rotated, so treat it as 0). When caught up, run `{{SCRIPTS_DIR}}/rotate-queue.sh --queue {{QUEUE_PATH}} --cursor {{CURSOR_PATH}}` (no-op unless the queue is large), and append handoffs to sibling queues while holding `flock -x <that queue's directory>/queue.lock`. You OWN {{SLICE}} — no other worker touches those.
 
 {{HANDOFFS}}
 

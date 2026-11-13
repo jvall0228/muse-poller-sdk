@@ -1,0 +1,20 @@
+{
+  "name": "example-source watcher",
+  "state_dir_name": "example-source",
+  "stop_file_name": "example-source-stop",
+  "poll_secs": 60,
+  "poll_jitter_secs": 5,
+  "backoff_steps_secs": [60, 120, 300],
+  "slow_call_secs": 10,
+  "call_timeout_secs": 60,
+  "max_failures": 5,
+  "channels": [
+    { "id": "team-queue", "name": "team-queue" }
+  ],
+  "adapter": "example_http_adapter",
+  "adapter_options": {
+    "base_url": "https://api.example.invalid/v1",
+    "token_env": "EXAMPLE_SOURCE_TOKEN",
+    "self_id": "bot-user-id"
+  }
+}

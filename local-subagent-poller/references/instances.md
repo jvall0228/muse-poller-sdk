@@ -50,11 +50,11 @@ template line is questioned, trace it here first.
   `<state-dir>/mentions-stop`.
 - **Measured:** warm reply ~23s end-to-end (a test mention from a server
   member, Nov 13 11:22 EST). Cold-start test pending (owner's two test mentions).
-- **Template note (Nov 13 review):** the `daemon.ts` template now counts
-  per-channel failures, treats an all-channels-failed cycle as a cycle
-  failure, writes `polled_at` on every successful cycle, writes state
-  atomically, takes a pidfile lock, and exits on auth errors — the
-  production watcher predates those changes.
+- **Template note:** `daemon.ts` is now a module with a source adapter and a
+  config file (1.1.0). It counts per-channel failures, treats an
+  all-channels-failed cycle as a cycle failure, writes `polled_at` on every
+  successful cycle, writes state atomically, takes a single-instance lock,
+  and exits on auth errors — the production watcher predates those changes.
 
 ## 3. Team chat queue — two-tier (Nov 13)
 
@@ -88,11 +88,11 @@ template line is questioned, trace it here first.
   path unassisted.
 - **Watch item:** gateway reads slowed twice on Nov 13 (10.1s, 13.7s).
   Headroom is fine at a 60s poll; do not tighten the poll in response.
-- **Template note (Nov 13 review):** the `daemon.py` template now writes
-  `polled_at` on every successful poll, writes state atomically, takes a
-  flock, and exits on auth errors or after N consecutive failures; the
-  `hook-watch.sh` template now decides outstanding work from the worker's
-  `.cursor` file and the worker lock, and the wake payload carries
+- **Template note:** `daemon.py` is now a module with a source adapter and a
+  config file (1.1.0). It writes `polled_at` on every successful poll,
+  writes state atomically, takes a flock, and exits on auth errors or after
+  N consecutive failures; `hook-watch.sh` decides outstanding work from the
+  worker's `.cursor` file and the worker lock, and the wake payload carries
   identifiers only — the production watcher and hook scripts predate those
   changes.
 

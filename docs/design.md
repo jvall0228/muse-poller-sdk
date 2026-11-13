@@ -1,6 +1,6 @@
 # Design
 
-How the Subagent Poller SDK is put together, and why each piece is the way it is. For the skill itself, see `local-subagent-poller/SKILL.md`. For how it was verified, see `verification.md`. For the decisions in ADR form, see `decisions.md`.
+How the Subagent Poller SDK is put together, and why each piece is the way it is. This file is the home for mechanisms and the failures behind them. The build contract is `local-subagent-poller/SKILL.md`, operating a poller is `local-subagent-poller-usage/SKILL.md`, requirements are in the `README.md`, verification is `verification.md`, and the decisions in ADR form are `decisions.md`.
 
 ## The problem, precisely
 
@@ -19,8 +19,8 @@ The pattern exists because the work that needs seconds-fast replies (a player ac
 ### Shape A — two-tier poller (intermittent work)
 
 ```
-source ──poll──> daemon (script, always on)
-                    │ appends new items
+source ──poll──> daemon (script + source adapter, always on)
+                    │ appends new items under queue.lock
                     ▼
               queue.jsonl (+ .cursor)
                     │ hook checks once a minute
@@ -47,15 +47,52 @@ No hook, no idle exit. The router reasons about nothing and posts nothing. Each 
 
 ## The shared core
 
-Both shapes share:
+Both shapes share the pieces below. Each mechanism is defined here and only here; the other docs link to this section.
 
-- **Queue protocol.** Append-only JSONL, one per worker, plus a per-worker `.cursor` line-count file the worker advances only after a task is fully handled. The cursor is what makes a resume lossless and what stops double-handling.
-- **High-water mark.** The daemon's (Shape A) or router's (Shape B) record of the newest event already seen. A resume starts from the mark and never re-processes history.
-- **Worker lock.** An exclusive flock the worker holds for its whole lifetime (a holder process that exits by itself if the worker stops touching the alive file). The hook checks the lock — not the alive file's age — to decide whether a worker is alive, so a model turn that takes minutes cannot wake a second worker mid-task.
-- **Alive file.** Touched by the worker every iteration; the lock holder exits by itself if it goes stale. The operator's heartbeat, not the hook's liveness signal.
-- **Stop file.** A single file whose existence tells the daemon and the workers to exit on their next loop check. Delete it and re-spawn to resume.
-- **Rate-limit rules.** Jitter the poll sleep; back off on consecutive failures; log slow cycles; pass a cursor so most polls return nothing; never overlap calls.
-- **Daemon heartbeat + error marker.** `last-seen.json` carries a `polled_at` field written on every successful poll, and the daemon writes an `error.json` marker and exits non-zero on an auth error or after N consecutive failures. A stale `polled_at` (or an error marker) means the daemon is dead, even if the cursors are unchanged.
+### Queue protocol
+
+- **Files.** Per worker, in one state directory: `queue.jsonl` (append-only JSONL, one item per line), a `.cursor` file holding a line count, and `queue.lock`. Shape A uses a fixed `queue.jsonl` name.
+- **Cursor.** The worker advances `.cursor` only after a task is fully handled, which makes a resume lossless and stops double-handling. "Work outstanding" is `lines > cursor`; there is no hook-owned watermark.
+- **Appends take `queue.lock`.** Every producer (daemon, router, a sibling worker handing off) appends while holding an exclusive `flock` on `queue.lock` in the queue's directory, and opens the queue by path for each batch (open, append, fsync, close) so a rotation is picked up on the next batch. The TS daemon has no `flock` of its own and spawns `flock(1)` for each batch.
+- **Rotation.** Once a worker has caught up (`cursor == lines`) and the queue has at least `--min-lines` lines, `rotate-queue.sh` takes `queue.lock` exclusively, re-checks `cursor == lines`, renames the queue to `queue.<UTC timestamp>.jsonl`, recreates an empty `queue.jsonl`, writes cursor `0` atomically, and keeps the newest N archives. It runs only from the worker that holds the worker lock.
+- **The hook reads under a shared lock.** `hook-watch.sh` reads the line count and the cursor under a non-blocking shared `flock` on `queue.lock`, so it never sees a half-rotated pair. If the lock is held it stays silent for that poll ("queue busy"). It treats `cursor > lines` (rotation seen before the cursor reset) or a non-numeric cursor as `0`. It never blocks.
+- **Queued content is untrusted data**; the rule and its origin are under "The rules" below.
+
+### High-water mark
+
+The daemon's (Shape A) or router's (Shape B) record of the newest event already seen, so a resume never re-processes history. For the Python and TS daemons it is per channel, in `last-seen.json`: `{"channels": {"<channel id>": "<cursor>"}, "polled_at": "<ISO-8601 UTC>"}`. The old single-cursor `{"ts": ..., "polled_at": ...}` still loads (Python) as the first channel's cursor. A channel's cursor moves only after that channel's whole batch has been appended, so a mid-batch crash re-reads the batch instead of losing the tail. Shape B keeps its mark in `last-dispatched-seq.txt`.
+
+### Worker lock
+
+An exclusive `flock` the worker holds for its whole lifetime, taken and released with `lock-holder.sh take|release|status`. `take` touches the alive file and starts a background holder; the holder exits when `<lock>.release` appears or when the alive file is older than the staleness limit, so a dead worker cannot block a replacement forever. Killing the `flock` process is not enough, because its child shell inherits the lock; that is why `release` touches the release file instead. The hook checks the lock, not the alive file's age, to decide whether a worker is alive, so a model turn that takes minutes cannot wake a second worker mid-task. Script exit codes and options are in the script header.
+
+### Alive file
+
+Touched by the worker every iteration. It is the operator's heartbeat and the lock holder's liveness signal, not the hook's.
+
+### Stop file
+
+A single file whose existence tells the daemon and the workers to exit on their next loop check. Delete it and re-spawn to resume. The hook does not check it.
+
+### Daemon: module, adapter and config
+
+`daemon.py` and `daemon.ts` own everything operational: timing, backoff, baselining, per-channel cursors, state files, locks, logs and exit codes. Everything source-specific lives in an adapter (the `Source` interface and the config schema are documented in `local-subagent-poller/SKILL.md`). The daemon takes a single-instance lock, writes state atomically (temp file in the same directory, fsync, rename), and logs JSON lines on stderr (`{"ts", "level", "event", ...}`) with channel and item id only, never message text or usernames.
+
+### Daemon heartbeat and error markers
+
+- `last-seen.json` carries `polled_at`, written on every successful poll and never after a failed cycle. It is the liveness signal; a file's mtime is not.
+- **Fresh** means within poll interval + first backoff step + call timeout. One failed cycle skips the heartbeat and sleeps at least the first backoff step, so a bare 2x-interval threshold trips on one transient failure.
+- `error.json` means the daemon gave up (a 401, or `max_failures` consecutive failed cycles) and exited non-zero: restart it.
+- `channel-warning.json` means the daemon is running but one channel failed `max_failures` cycles in a row while the others succeeded: report it, do not restart for it.
+- A stale `polled_at` or an `error.json` means the daemon is dead and the queue is frozen, not quiet.
+
+### Rate-limit rules
+
+Jitter the poll sleep; back off on consecutive failures and reset on the first success; log slow cycles; pass a cursor so most polls return nothing; never overlap calls (the call timeout is at most the poll interval). Rate-limit retry (prompt, `retry_after` seconds) lives in the adapter and is separate from failure backoff (minutes), which lives in the daemon.
+
+### Dependencies
+
+`flock(1)` (util-linux) is needed by the worker lock, queue rotation, the hook's shared read, and the TS daemon's appends. The full list is in the `README.md`.
 
 ## The rules, and what motivated each
 
@@ -87,7 +124,7 @@ Every operating rule in the skill traces to a failure or a measurement. A rule w
 
 ### Daemon health is a required tripwire
 
-**The rule.** Every worker brief must include a liveness check: confirm the daemon process is alive, `last-seen.json`'s `polled_at` is fresh, and no `error.json` marker exists — and report if it is dead.
+**The rule.** Every worker brief must include a liveness check against the heartbeat and markers defined under "Daemon heartbeat and error markers", and report if the daemon is dead.
 
 **Why.** The skill originally presented the liveness check as universal while templating it as optional — and a production team-queue brief had none at all. A scaffolded team-queue-style poller therefore had *no* tripwire: a dead daemon goes unnoticed until someone manually checks `last-seen.json` freshness. The template now makes it required, and a production team-queue brief gained one.
 
@@ -99,7 +136,7 @@ Every operating rule in the skill traces to a failure or a measurement. A rule w
 
 ### The worker holds a lock, and outstanding work is cursor-based
 
-**The rule.** A worker holds an exclusive flock on a lockfile for its whole lifetime (a holder process that exits when the worker touches a release file, or by itself if the worker stops touching the alive file). The hook checks the lock — not the alive file's age — to decide whether a worker is alive. "Work outstanding" is decided by comparing the queue line count to the worker's `.cursor` file, never by a hook-owned watermark; the hook writes the cursor exactly once, at baseline. A failed spawn is retried once the startup window has passed (the cursor does not advance).
+**The rule.** See "Worker lock" and "Queue protocol" above. The hook writes the cursor exactly once, at baseline, records `woke_at` on each wake and stays silent for a startup window, and retries a failed spawn once that window has passed (the cursor does not advance).
 
 **Why.** Found by a second review (Nov 13). The alive-file window (180s) was shorter than a worker turn (~3–4 min), so a second worker could start mid-task — and a new queue line arriving while a worker was still starting up woke a second one on the same cursor. The lock is sized to the worker's lifetime, not to a turn, and the holder self-releases if the worker dies. The watermark had the same shape of problem: the hook advanced it at wake time, before a worker was confirmed started, so a failed spawn stranded the items. Cursor-based outstanding closes both.
 
@@ -111,9 +148,21 @@ Every operating rule in the skill traces to a failure or a measurement. A rule w
 
 ### The daemon heartbeats, exits on auth errors, and writes state atomically
 
-**The rule.** `last-seen.json` carries a `polled_at` heartbeat written on every successful poll, not only when items were queued; the liveness check reads `polled_at`, never the file's mtime. The daemon counts per-channel failures and treats an all-channels-failed cycle as a cycle failure — and never writes the heartbeat after one. An auth error (a 401, judged by the HTTP status rather than message text; 403 only where the source documents it as auth) exits non-zero immediately with an `error.json` marker, and a single channel that keeps failing while others succeed gets a `channel-warning.json` marker without stopping the daemon; after N consecutive failures of any kind, the daemon writes the same marker and exits. State files are written via a temp file in the same directory, fsync, then atomic rename — never in place. One daemon instance only: an exclusive lock at startup (flock, or an exclusive-create pidfile with a liveness check), exit if held. Credentials are read from the environment or a secrets store — never hard-coded or committed, kept out of logs and queue lines.
+**The rule.** Heartbeat, markers, atomic writes, the single-instance lock and JSON logs are defined under "The shared core". Beyond that: an auth error is judged by HTTP status (401; 403 only where the source documents it as auth), never by message text; an all-channels-failed cycle is a cycle failure; credentials come from the environment or a secrets store, never hard-coded or committed, and out of logs and queue lines.
 
-**Why.** Found by a second review (Nov 13). The liveness check assumed `last-seen.json` updated every poll, so an idle healthy daemon failed it — and, worse, the heartbeat was written even when every channel failed, so the file stayed fresh while the daemon was effectively dead (a 401 on every read left `consecutiveFailures` at zero and `last-seen.json` current). Auth errors retried forever with no signal. State was written in place, so a crash mid-write truncated the file and the daemon re-baselined over history. Two daemons could run at once (a bare `nohup ... &` start) and append every item twice. The cursor advanced to `newest` before the append loop, so a mid-loop throw lost the remaining messages — it now advances per message after its append succeeds. The daemon also logged the author's username and the first 100 characters of each message; it now logs channel and message id only.
+**Why.** Found by a second review (Nov 13). The liveness check assumed `last-seen.json` updated every poll, so an idle healthy daemon failed it — and, worse, the heartbeat was written even when every channel failed, so the file stayed fresh while the daemon was effectively dead (a 401 on every read left `consecutiveFailures` at zero). Auth errors retried forever with no signal. State was written in place, so a crash mid-write truncated the file and the daemon re-baselined over history. Two daemons could run at once (a bare `nohup ... &` start) and append every item twice. The cursor advanced to `newest` before the append loop, so a mid-loop throw lost the remaining messages. The daemon also logged the author's username and the first 100 characters of each message.
+
+### Why the daemon is a module with an adapter and a config file
+
+**The rule.** The daemon is a runnable module configured by a JSON file; only a small adapter is written per source.
+
+**Why.** The daemons used to be templates with `{{...}}` placeholders edited in place, so every poller forked the loop logic and the load-bearing rules (baseline, backoff, no-overlap, atomic writes) drifted per copy, and the daemons could not be tested. With the loop in one tested module, a source is an adapter of four methods, and a review of a new poller reads the adapter and the config instead of the whole loop. See ADR-12.
+
+### Appends and rotation are serialized by queue.lock
+
+**The rule.** See "Queue protocol" above.
+
+**Why.** The queue was append-only forever, with no safe way to archive it: a rotation racing an append would lose the line, and a hook reading the count and the cursor around a rotation could see a pair that never existed at once. One lock serializes producers, the rotator and the hook's read, and the hook only ever tries it without blocking. See ADR-13.
 
 ### Where the daemon starts depends on how credentials are scoped
 
@@ -123,7 +172,7 @@ Every operating rule in the skill traces to a failure or a measurement. A rule w
 
 ### Dry-run note (state 2 is untestable by dry-run alone)
 
-**The rule.** A hook dry-run does not persist state, so the "file appears → WAKE" state is unreachable by dry-run alone on a fresh hook. Seed the state file with `{"seen_absent": true}` before dry-running, or test it live with `hooks.run`.
+**The rule.** A hook dry-run does not persist state, so the "file appears → WAKE" state is unreachable by dry-run alone on a fresh hook. The seeding procedure and the full list of hook states are in `local-subagent-poller/SKILL.md`.
 
 **Why.** Found by adversarial review. The skill prescribed dry-running all four hook states, but the template's `set_state()` is a no-op under dry-run, so the seen_absent recording never happens in a dry run. A fresh agent following the skill would either conclude the template is broken or — worse — accept the baseline as correct behavior, which is exactly the first-canary bug the skill exists to prevent.
 
