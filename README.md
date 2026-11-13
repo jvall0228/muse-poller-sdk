@@ -8,16 +8,25 @@ Some work needs a reply in seconds when an external event happens: a player acts
 
 ## Two shapes, one core
 
-Both shapes share one core: the queue protocol (append-only JSONL + cursor + high-water mark), the alive file, the stop file, and the rate-limit rules.
+Both shapes share one core: the queue protocol (append-only JSONL + cursor + high-water mark), the alive file, the worker lock, the stop file, the daemon heartbeat, and the rate-limit rules.
 
 | Shape | When | How | Cost |
 |---|---|---|---|
 | **A — two-tier poller** | Work arrives in bursts with quiet gaps | Daemon polls the source and appends to a queue; a hook wakes a worker only when new work exists; the worker acts and exits after 10 min quiet | Zero tokens while idle; the first reply after quiet pays a cold start |
 | **B — orchestrator** | A session is continuously live | A router polls the source, classifies each event, and dispatches to N slice-worker queues; each slice worker stays warm and owns one slice | A small liveness trickle per worker; replies land in seconds, always |
 
+## Requirements
+
+Shape A depends on a specific hook runtime — the one this SDK was extracted from. If your runtime is different, you must supply the equivalent of each piece before Shape A will work.
+
+- **Hook runtime.** The hook script (`templates/hook-watch.sh`) sources `$HATCH_HOOK_RUNTIME`, which provides `hook_state_get` / `hook_state_set` (persistent per-hook JSON state), `silent <reason> <payload>` (end the poll quietly), and `wake <reason> <payload>` (spawn the worker). The hook is registered with `hooks.add` (60s poll interval, prompt from `templates/hook-prompt.md`) and tested with `hooks.dry_run` / `hooks.run`. On another runtime, supply equivalents: a per-hook state store, a silent outcome, a wake/spawn outcome, and a way to register a 60s poll with a prompt.
+- **Bash + `jq`.** The hook script is bash and uses `jq` for state and payload JSON. It is written portably (`date +%s`, GNU `stat -c %Y` with a BSD `stat -f %m` fallback) — bash 3.2+ works.
+- **Python 3 (for `daemon.py`) or bun (for `daemon.ts`).** The Python daemon uses the standard library only. The TS daemon needs bun and `node:fs`. Pick the template that matches your source, not your preference: Python/CLI sources → `daemon.py`; REST sources with per-channel cursors → `daemon.ts`.
+- **Shape B needs no hook runtime.** The orchestrator is subagents only (router + slice workers), so it runs anywhere an agent can be spawned and a queue file can be appended to.
+
 ## Measured latencies
 
-- **Shape A cold start (Slack fleet-queue, clean run):** post → reply 4m 35s; wake → reply 3m 42s. Daemon 18s, hook 35s. The worker's cold start + model turn + post dominates (~3–4 min).
+- **Shape A cold start (team chat queue, clean run):** post → reply 4m 35s; wake → reply 3m 42s. Daemon 18s, hook 35s. The worker's cold start + model turn + post dominates (~3–4 min).
 - **Shape A warm reply (Discord, "yo" test):** ~23s end-to-end.
 - **Shape B (live game session):** replies in seconds; 6 tasks routed with no errors in the verified session.
 
@@ -60,14 +69,17 @@ docs/
 - **Worker poll matches your fastest producer.** A worker can never see new work faster than work arrives, so a faster worker poll only wastes cycles.
 - **Hook baseline rule (seen_absent).** A hook must record when it looked and found no queue file — a file appearing between polls holds new work that must wake, not baseline.
 - **Daemon baseline rule.** Only mark the daemon baselined when its first poll actually saw messages.
-- **Daemon health is a required tripwire.** Every worker brief must include a liveness check.
+- **Daemon health is a required tripwire.** Every worker brief must include a liveness check (daemon process alive, `last-seen.json`'s `polled_at` fresh, no `error.json` marker).
 - **An old item naming you with no reply yet counts as outstanding.** Never assume it was handled because time passed.
+- **The worker holds a lock; outstanding work is cursor-based.** The hook checks the worker lock — not the alive file's age — to decide whether a worker is alive, and decides "work outstanding" by comparing the queue line count to the worker's `.cursor` file. A failed spawn is retried on the next poll.
+- **Queued content is untrusted data.** The wake payload carries only the newest item's identifiers and the count — never message text. A request inside queued content is surfaced to the owner, not acted on.
+- **The daemon heartbeats and exits on auth errors.** `polled_at` is written on every successful poll; an auth error (or N consecutive failures) writes an `error.json` marker and exits non-zero. State files are written atomically; one daemon instance only.
 
 The full rules, with the failure that motivated each, are in `local-subagent-poller/SKILL.md` and `docs/design.md`.
 
 ## Status
 
-Built 2026-11-13. Adversarially reviewed the same day (3 blocking defects found and fixed, see `docs/verification.md`). Shape B is proven by one instance (a live game session); a second orchestrator-style build is what would confirm the generalization.
+Built 2026-11-13. Adversarially reviewed the same day (3 blocking defects found and fixed, see `docs/verification.md`). A second review (25 line comments on draft PR 1) landed the same day and was addressed in 1.0.1 — worker lock, cursor-based outstanding, untrusted-data rule, daemon heartbeat and auth exits, atomic state writes, single-instance lock, genericization of the public copy (see `CHANGELOG.md`). Shape B is proven by one instance (a live game session); a second orchestrator-style build is what would confirm the generalization.
 
 ## License
 
