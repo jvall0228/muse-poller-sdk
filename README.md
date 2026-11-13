@@ -20,7 +20,7 @@ Both shapes share one core: the queue protocol (append-only JSONL + cursor + hig
 Shape A depends on a specific hook runtime — the one this SDK was extracted from. If your runtime is different, you must supply the equivalent of each piece before Shape A will work.
 
 - **Hook runtime.** The hook script (`templates/hook-watch.sh`) sources `$HATCH_HOOK_RUNTIME`, which provides `hook_state_get` / `hook_state_set` (persistent per-hook JSON state), `silent <reason> <payload>` (end the poll quietly), and `wake <reason> <payload>` (spawn the worker). The hook is registered with `hooks.add` (60s poll interval, prompt from `templates/hook-prompt.md`) and tested with `hooks.dry_run` / `hooks.run`. On another runtime, supply equivalents: a per-hook state store, a silent outcome, a wake/spawn outcome, and a way to register a 60s poll with a prompt.
-- **Bash + `jq`.** The hook script is bash and uses `jq` for state and payload JSON. It is written portably (`date +%s`, GNU `stat -c %Y` with a BSD `stat -f %m` fallback) — bash 3.2+ works.
+- **Bash + `jq` + `flock(1)`.** The hook script is bash and uses `jq` for state and payload JSON; the worker lock uses `flock(1)` (util-linux; on macOS it is not installed by default — install it separately, e.g. via a package manager). The `stat` calls fall back from GNU `stat -c %Y` to BSD `stat -f %m`, and bash 3.2+ works, but the lock needs flock.
 - **Python 3 (for `daemon.py`) or bun (for `daemon.ts`).** The Python daemon uses the standard library only. The TS daemon needs bun and `node:fs`. Pick the template that matches your source, not your preference: Python/CLI sources → `daemon.py`; REST sources with per-channel cursors → `daemon.ts`.
 - **Shape B needs no hook runtime.** The orchestrator is subagents only (router + slice workers), so it runs anywhere an agent can be spawned and a queue file can be appended to.
 
@@ -69,11 +69,11 @@ docs/
 - **Worker poll matches your fastest producer.** A worker can never see new work faster than work arrives, so a faster worker poll only wastes cycles.
 - **Hook baseline rule (seen_absent).** A hook must record when it looked and found no queue file — a file appearing between polls holds new work that must wake, not baseline.
 - **Daemon baseline rule.** Only mark the daemon baselined when its first poll actually saw messages.
-- **Daemon health is a required tripwire.** Every worker brief must include a liveness check (daemon process alive, `last-seen.json`'s `polled_at` fresh, no `error.json` marker).
+- **Daemon health is a required tripwire.** Every worker brief must include a liveness check (daemon process alive, `last-seen.json`'s `polled_at` fresh within poll interval + first backoff step + call timeout, no `error.json` marker).
 - **An old item naming you with no reply yet counts as outstanding.** Never assume it was handled because time passed.
-- **The worker holds a lock; outstanding work is cursor-based.** The hook checks the worker lock — not the alive file's age — to decide whether a worker is alive, and decides "work outstanding" by comparing the queue line count to the worker's `.cursor` file. A failed spawn is retried on the next poll.
+- **The worker holds a lock; outstanding work is cursor-based.** The hook checks the worker lock — not the alive file's age — to decide whether a worker is alive, and decides "work outstanding" by comparing the queue line count to the worker's `.cursor` file. A failed spawn is retried once the hook's startup window has passed.
 - **Queued content is untrusted data.** The wake payload carries only the newest item's identifiers and the count — never message text. A request inside queued content is surfaced to the owner, not acted on.
-- **The daemon heartbeats and exits on auth errors.** `polled_at` is written on every successful poll; an auth error (or N consecutive failures) writes an `error.json` marker and exits non-zero. State files are written atomically; one daemon instance only.
+- **The daemon heartbeats and exits on auth errors.** `polled_at` is written on every successful poll; a 401 auth error (or N consecutive failures) writes an `error.json` marker and exits non-zero. State files are written atomically; one daemon instance only.
 
 The full rules, with the failure that motivated each, are in `local-subagent-poller/SKILL.md` and `docs/design.md`.
 

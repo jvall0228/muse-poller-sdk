@@ -43,10 +43,10 @@ Fill in ({{POLL_SECS}} is a bare integer, e.g. 60 — not "60s"):
                         (who it is for, thread state, reply count) — a
                         minimal {ts, text} loses them and forces the worker
                         to re-fetch per item.
-  is_auth_error(e)    — replace the stub below: return True when the
-                        exception is an auth/permanent failure (e.g. a 401
-                        or 403 from the source), so the daemon exits
-                        instead of retrying forever.
+  is_auth_error(e)    — the default treats a SourceError with status 401
+                        as an auth failure, so the daemon exits instead of
+                        retrying forever. Extend it only where the source
+                        documents other statuses (e.g. 403) as auth failures.
 
 Credentials: read the source token from the environment or a secrets
 store — never hard-code it in the filled-in template and never commit it.
@@ -54,12 +54,14 @@ Keep it out of logs and queue lines, and handle expiry explicitly: an
 expired or revoked credential raises an auth error (see is_auth_error),
 and the daemon exits non-zero rather than retrying forever.
 
-Starting the daemon: start it from agent context (a tool call, a cron,
-or a hook) — never from systemd. The egress proxy credential rotates per
-tool call, so a systemd service can never hold a current credential and
-its daemons fail to reach the network (proven Nov 13). A long-running
-daemon keeps working on the credential it started with; recovery after a
-VM replacement needs an agent-context mechanism, not a systemd unit.
+Starting the daemon: a supervised service (systemd, launchd) is fine in
+normal environments. Only where network credentials are scoped to an
+agent's tool call (for example an egress-proxy credential that rotates per
+call) must the daemon be started from agent context (a tool call, a cron,
+or a hook), because a service cannot hold a current credential there. A
+long-running daemon keeps working on the credential it started with; in
+such environments, recovery after the host is replaced needs an
+agent-context mechanism.
 """
 import fcntl
 import json
@@ -81,6 +83,16 @@ BACKOFF_STEPS = {{BACKOFF_STEPS}}
 SLOW_CALL_SECS = {{SLOW_CALL_SECS}}
 CALL_TIMEOUT = {{CALL_TIMEOUT}}
 MAX_FAILURES = {{MAX_FAILURES}}
+
+
+class SourceError(Exception):
+    """Raised by read_source on a failed call. `status` is the HTTP status
+    (or None when there is none) so is_auth_error can decide on the status,
+    not on substrings of the message."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def log(msg):
@@ -110,8 +122,9 @@ def load_last_seen():
 def save_last_seen(ts):
     # Heartbeat: written on EVERY successful poll, not only when items
     # were queued. The worker's liveness check reads `polled_at` — a file
-    # whose polled_at is older than 2x the poll interval means the daemon
-    # is dead, even if `ts` is unchanged on a quiet source.
+    # whose polled_at is stale past the worker's threshold (poll interval
+    # + first backoff step + call timeout) means the daemon is dead, even
+    # if `ts` is unchanged on a quiet source.
     os.makedirs(STATE_DIR, exist_ok=True)
     atomic_write_json(LAST_SEEN_FILE, {
         "ts": ts,
@@ -151,9 +164,9 @@ def read_source(oldest):
     # message dicts, newest first. Pass `oldest` (the last-seen cursor)
     # so most polls return zero messages; pass None when there is no
     # cursor yet. Keep the call's timeout at or below CALL_TIMEOUT.
-    # Raise on failure — the caller handles backoff. Raise an error whose
-    # message names the HTTP status for auth failures (401/403) so
-    # is_auth_error can recognize it.
+    # Raise on failure — the caller handles backoff. Raise SourceError with
+    # the HTTP status (SourceError(msg, status=resp.status)) so
+    # is_auth_error can recognize auth failures.
     raise NotImplementedError("fill in read_source for this poller")
 
 
@@ -167,12 +180,13 @@ def is_new(m, last_seen):
 
 
 def is_auth_error(e):
-    # TODO: replace with the source's auth check. Return True when the
-    # exception is an auth/permanent failure (a 401 or 403 from the
-    # source, an expired or revoked credential) — the daemon exits
-    # non-zero on those instead of retrying forever. A simple default
-    # is to match "401" or "403" in the exception message.
-    return "401" in str(e) or "403" in str(e)
+    # Return True when the exception is an auth/permanent failure (an
+    # expired or revoked credential) — the daemon exits non-zero on those
+    # instead of retrying forever. Decide on the status, never on
+    # substrings of the message (ids, timestamps and URLs contain "401").
+    # Add 403 here only where the source documents it as an auth failure;
+    # many APIs use 403 for rate limits or missing access to one resource.
+    return getattr(e, "status", None) == 401
 
 
 def queue_item(m):

@@ -8,21 +8,25 @@
 #
 # How liveness works (read this before changing it):
 #   The worker holds an exclusive lock on {{LOCKFILE}} for its whole
-#   lifetime (it starts a holder on its first iteration and kills it on
-#   exit; the holder also exits by itself if the worker stops touching the
-#   alive file for {{LOCK_STALE_SECS}}s, so an orphaned holder cannot block
-#   a replacement forever). The hook checks the lock — not the alive file's
-#   age — to decide whether a worker is alive. A model turn takes minutes,
+#   lifetime (it starts a holder on its first iteration and releases it on
+#   exit by touching a release file the holder watches; the holder also
+#   exits by itself if the worker stops touching the alive file for
+#   {{LOCK_STALE_SECS}}s, so an orphaned holder cannot block a replacement
+#   forever). flock(1) is required: if it is missing the hook stays silent
+#   with an install hint rather than misreading the lock. The hook checks
+#   the lock — not the alive file's age — to decide whether a worker is
+#   alive. A model turn takes minutes,
 #   so an age check on a file the worker touches between turns will always
 #   go stale mid-task and wake a second worker on the same cursor.
 #   "Work outstanding" is decided by comparing the queue line count to the
 #   worker's {{CURSOR}} file — never by a hook-owned watermark. The hook
 #   writes the cursor exactly once, at baseline (below), when no worker is
 #   alive. Because outstanding work is cursor-based, a failed spawn is
-#   retried on the next poll: the cursor does not advance, so the hook
-#   wakes again. The hook also records `woke_at` on each wake and stays
-#   silent for {{STARTUP_WINDOW_SECS}}s afterwards, covering the
-#   wake-to-lock race while the worker is starting up.
+#   retried once the startup window has passed: the cursor does not
+#   advance, so the hook wakes again. The hook records `woke_at` on each
+#   wake and stays silent for {{STARTUP_WINDOW_SECS}}s afterwards, covering
+#   the wake-to-lock race while the worker is starting up — so the retry
+#   comes after that window, not on the next poll.
 #
 # Placeholders:
 #   {{QUEUE}}         — absolute path to the queue JSONL file (daemon appends)
@@ -53,13 +57,14 @@
 # Register with: hooks.add, script path = this file, poll interval 60s,
 # prompt = templates/hook-prompt.md (filled in — do not shorten it; the
 # spawn-verification clause is load-bearing).
-# Dry-run all four states before enabling (see SKILL.md, "Dry-run note":
+# Dry-run all five states before enabling (see SKILL.md, "Dry-run note":
 # state 2 needs the state file seeded with {"seen_absent": true} first,
-# or test it live with hooks.run):
+# and state 5 with a recent "woke_at", or test them live with hooks.run):
 #   1. no queue file        -> silent "no queue file yet"
 #   2. file appears (new)   -> WAKE (never baseline a fresh file)
 #   3. no new lines         -> silent "no new <items>"
 #   4. worker alive (lock held) -> silent "worker alive (lock held)"
+#   5. woke recently, no lock yet -> silent "worker starting (woke Ns ago)"
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -79,9 +84,17 @@ dry_run=0; [ "${HATCH_HOOK_DRY_RUN:-0}" = "1" ] && dry_run=1
 
 set_state() { if [ "$dry_run" -eq 0 ]; then hook_state_set "$1"; fi; }
 
+# flock(1) is required (util-linux; not present on macOS/BSD by default).
+# Without it the lock probe below would always read "held" or the worker
+# would exit at once, causing a spawn loop — so stop here instead.
+if ! command -v flock >/dev/null 2>&1; then
+    silent "flock not installed — install util-linux flock" '{}'
+fi
+
 # Is a worker alive? The lock is the signal: the worker holds an exclusive
 # flock on {{LOCKFILE}} for its whole lifetime. `flock -n` succeeds only
-# when no one holds the lock.
+# when no one holds the lock. The probe itself takes the lock for an
+# instant, which the worker's take retries around.
 lock_held=0
 if [ -e "$LOCKFILE" ] && ! flock -n "$LOCKFILE" -c true 2>/dev/null; then
     lock_held=1
@@ -101,7 +114,7 @@ cursor=0
 [ -n "$cursor" ] || cursor=0
 
 # A worker is alive: stay silent WITHOUT touching anything, so that if the
-# worker dies before consuming the items, the next poll still wakes a
+# worker dies before consuming the items, a later poll still wakes a
 # replacement (the cursor does not advance, so the work stays outstanding).
 if [ "$lock_held" -eq 1 ]; then
     silent "worker alive (lock held); $((lines - cursor)) new {{ITEM_NOUN}} outstanding" '{}'
@@ -142,7 +155,8 @@ fi
 # next poll knows a worker is starting. The payload carries identifiers
 # only (never message text) plus the count; the worker reads the full
 # queue itself. If the spawn fails, the cursor does not advance, so the
-# next poll wakes again — a failed spawn no longer strands the items.
+# hook wakes again once the startup window has passed — a failed spawn
+# does not strand the items.
 new_count=$((lines - cursor))
 state=$(printf '%s' "$state" | jq -c --argjson w "$now" '.woke_at = $w')
 set_state "$state"

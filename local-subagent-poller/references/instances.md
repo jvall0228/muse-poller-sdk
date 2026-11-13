@@ -22,7 +22,7 @@ template line is questioned, trace it here first.
   (narrator/combat hand off at any time), so it can lag a dispatch by
   up to 15s. Do not copy the 15s rate without that latency cost.
 - **Stop file:** `<state-dir>/orchestrator-stop`.
-- **Skill:** `live-game-orchestrator` (full worker briefs + routing table).
+- **Skill:** a project-specific orchestrator skill (full worker briefs + routing table).
 - **Verified:** session 2, 6 tasks routed, no errors, no double-handling.
 - **Why it exists:** hooks take minutes per reply, crons floor at 1 min —
   both too slow for live session play (the owner's call).

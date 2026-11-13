@@ -23,7 +23,7 @@ A poller built with the SDK has the same pieces in both shapes:
 | **Router + slice workers** (Shape B) | Router polls the source and dispatches to N queues; each slice worker stays warm and owns one slice. No hook, no idle exit. | Briefs in the poller's directory |
 | **Queue** | Append-only JSONL, one per worker, plus a `.cursor` line-count file the worker advances only after a task is fully handled. | `~/hooks/state/<poller>/` |
 | **Worker lock** | Exclusive flock the worker holds for its whole lifetime. The hook checks the lock — not the alive file's age — to decide whether a worker is alive. | `~/hooks/state/<poller>/worker.lock` |
-| **Alive file** | Touched by the worker every iteration. The operator's heartbeat: fresh (< 3 min) means the worker is actively iterating. The lock holder exits by itself if the file goes stale past the staleness window. | `~/hooks/state/<poller>/worker-alive` |
+| **Alive file** | Touched by the worker every iteration. The operator's heartbeat: a recent mtime means the worker is iterating. A model turn can take several minutes, so a stale alive file with the lock held only matters once it is older than `{{LOCK_STALE_SECS}}`; the lock holder exits by itself past that window. | `~/hooks/state/<poller>/worker-alive` |
 | **Error marker** | `error.json` in the state dir. The daemon writes it and exits non-zero on an auth error or after N consecutive failures. Its presence means the daemon gave up — restart it, do not wait for it. | `~/hooks/state/<poller>/error.json` |
 | **Stop file** | A single file whose existence tells the daemon and the workers to exit on their next loop check. | `~/hooks/state/<poller>-stop` |
 | **High-water mark** | The router's (Shape B) or daemon's (Shape A) record of the newest event already seen, so a resume never re-processes history. | `last-seen.json` (Shape A) or `last-dispatched-seq.txt` (Shape B) |
@@ -43,19 +43,18 @@ A poller built with the SDK has the same pieces in both shapes:
 
 Run this whenever replies stop or before a session:
 
-1. **Daemon alive?** `ps` for the watcher process, `last-seen.json`'s `polled_at` within 2× the poll interval, and no `error.json` marker. A stale `polled_at` (or an error marker) means the queue is frozen, not quiet. Do not judge by the file's mtime: the daemon writes `polled_at` on every successful poll, so a quiet source still updates it — an idle healthy daemon has a fresh `polled_at`, and a file whose `polled_at` is stale is a dead daemon.
-2. **Cursor vs queue lines (Shape A).** The cursor should equal the line count when quiet. If lines > cursor and no worker is alive (no lock held), a wake is due — check the hook's log for the last decision. There is no hook-owned watermark anymore.
-3. **Cursor vs queue lines.** The cursor should equal the line count when the worker has caught up. If the cursor lags, the worker is behind or dead — check the lock and the alive file.
-4. **Worker lock held?** If the lock is held, a worker is live. The alive file is the operator's heartbeat — fresh (< 3 min) means the worker is actively iterating; stale with the lock held means the worker stopped touching it (a stall or a dying worker) and the holder will release the lock on its own.
+1. **Daemon alive?** `ps` for the watcher process, `last-seen.json`'s `polled_at` (an ISO-8601 UTC timestamp) within the threshold, and no `error.json` marker. The threshold is poll interval + first backoff step + call timeout (or simply 2× the poll interval plus the first backoff step): a single failed cycle skips the heartbeat and sleeps at least the first backoff step, so a bare 2× threshold trips on one transient failure. A `polled_at` stale past it (or an error marker) means the queue is frozen, not quiet. Do not judge by the file's mtime: the daemon writes `polled_at` on every successful poll, so a quiet source still updates it — an idle healthy daemon has a fresh `polled_at`, and a file whose `polled_at` is stale is a dead daemon. A `channel-warning.json` marker (multi-channel daemon) means the daemon is running but one or more channels keep failing — report it to the owner; do not restart for it.
+2. **Cursor vs queue lines (Shape A).** The cursor should equal the line count when the worker has caught up. If lines > cursor and no worker is alive (no lock held), a wake is due — check the hook's log for the last decision (it stays silent for the startup window after a wake). If the cursor lags with a worker alive, the worker is behind or dead — check the lock and the alive file. There is no hook-owned watermark.
+3. **Worker lock held?** If the lock is held, a worker is live. The alive file is the operator's heartbeat; a model turn can take several minutes, so a stale alive file with the lock held only matters once it is older than `{{LOCK_STALE_SECS}}` — then the worker stopped touching it (a stall or a dying worker) and the holder releases the lock on its own.
 
 ## Workflow — stop and resume
 
 - **Stop:** write the stop file. The daemon and all workers exit on their next loop check and report. For Shape A, also disable the hook — the hook does not check the stop file, so if items are queued when it is touched, it still wakes a worker that exits immediately (one wasted cold start).
-- **Resume:** delete the stop file. Shape A: re-enable the hook and restart the daemon from agent context (a tool call or a cron — never systemd: the egress proxy credential rotates per tool call, so a systemd service can never hold a current credential; see the SDK skill). The daemon resumes from `last-seen.json` — no re-baseline, no lost items. Shape B: re-spawn all workers with fresh briefs; the router starts from the high-water mark and will not re-dispatch old events, and slice workers resume from their `.cursor` files.
+- **Resume:** delete the stop file. Shape A: re-enable the hook and restart the daemon the way it was started (a supervised service is fine normally; only where network credentials are scoped to an agent's tool call must it be restarted from agent context — see the SDK skill). The daemon resumes from `last-seen.json` — no re-baseline, no lost items. Shape B: re-spawn all workers with fresh briefs; the router starts from the high-water mark and will not re-dispatch old events, and slice workers resume from their `.cursor` files.
 
 ## Operating rules
 
-- **Never restart the daemon to "fix" a quiet queue.** A quiet queue with a fresh `last-seen.json` `polled_at` is working as designed. Restart only when the daemon is dead, its `polled_at` is stale, or an `error.json` marker exists.
+- **Never restart the daemon to "fix" a quiet queue.** A quiet queue with a fresh `last-seen.json` `polled_at` is working as designed. Restart only when the process is dead, an `error.json` marker exists, or `polled_at` is stale past the health-check threshold.
 - **Never delete the queue, the cursor, or the high-water mark to clear a stall.** That destroys the resume state and re-queues history. Fix the worker, then let it drain the backlog from its cursor.
 - **A queue that stays empty is a failure signal, not idleness.** If a downstream queue (e.g. record-keeping) stays empty across a session, the upstream workers aren't sending tasks to it — the pipeline is broken, not idle.
 - **One worker at a time per queue.** If two workers are alive on the same queue, stop one — the worker lock is what the hook uses to avoid this, so check the lock before spawning a manual replacement.
@@ -63,11 +62,11 @@ Run this whenever replies stop or before a session:
 
 ## Failure modes
 
-- **A wake never lands (Shape A).** Check the cursor against the queue's line count and whether the worker lock is held. A failed spawn is retried on the next poll (the cursor does not advance). If the hook baselined over a freshly created queue (its state has no `seen_absent` and no `baselined` flag), the item was swallowed — the fix is in the SDK skill (the seen_absent rule); as a workaround, append a new item to re-trigger a wake, and have the worker drain the backlog from its cursor.
+- **A wake never lands (Shape A).** Check the cursor against the queue's line count and whether the worker lock is held. A failed spawn is retried once the startup window has passed (the cursor does not advance). If the hook baselined over a freshly created queue (its state has no `seen_absent` and no `baselined` flag), the item was swallowed — the fix is in the SDK skill (the seen_absent rule); as a workaround, append a new item to re-trigger a wake, and have the worker drain the backlog from its cursor.
 - **A worker stalls on a slow step** (e.g. a large upload). Split slow steps into their own worker with a retry cap, so one stall can't freeze the rest. Cover any unanswered items manually in the meantime.
 - **A dead daemon goes unnoticed.** The worker's liveness check is the only tripwire — if the daemon's `last-seen.json` `polled_at` goes stale or an `error.json` marker exists, restart the daemon and confirm the baseline log line before trusting the queue again.
 - **Double-handling.** Exactly-once routing depends on the high-water mark advancing after dispatch. If the router dies mid-dispatch, a resume may re-route — workers must tolerate a duplicate task idempotently; check the cursor before re-acting.
-- **A worker exits but items remain.** The hook wakes a replacement on the next poll (cursor-based outstanding — it does not wait for a new item). If no wake lands, spawn a worker manually from the brief so it drains the backlog.
+- **A worker exits but items remain.** The hook wakes a replacement on a later poll, once the startup window has passed (cursor-based outstanding — it does not wait for a new item). If no wake lands, spawn a worker manually from the brief so it drains the backlog.
 
 ## When to rebuild instead of operate
 
@@ -76,6 +75,6 @@ If the source, the routing table, the decision rules, or the poll rates change, 
 ## Output Contract
 
 When operating a poller, produce:
-- A health verdict from the four checks above (daemon, cursor, lock, alive file) with the numbers, not a feeling.
+- A health verdict from the three checks above (daemon, cursor, lock and alive file) with the numbers, not a feeling.
 - For a stop/resume: the stop file written (or deleted), the hook disabled (or re-enabled), and the workers' exit reports collected.
 - For a stall: the item(s) covered manually, the cause found, and the fix applied — or the scaffold change named if the fix belongs in the SDK skill.

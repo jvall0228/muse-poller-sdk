@@ -12,10 +12,11 @@
      spawn-verification clause matters: a failed spawn used to be silent
      data loss because the hook advanced its watermark when it woke. The
      hook now decides "work outstanding" by comparing the queue line count
-     to the worker's .cursor file, so a failed spawn is retried on the next
-     poll (the cursor does not advance) — but the verification still
-     matters, because it surfaces a broken spawn path instead of letting
-     the hook retry it silently every minute.
+     to the worker's .cursor file, so a failed spawn is retried once the
+     hook's startup window has passed (the cursor does not advance) — but
+     the verification still matters, because it surfaces a broken spawn
+     path instead of letting the hook retry it silently after every
+     startup window.
 
      Placeholders:
      {{ITEM_NOUN}}        — e.g. "team-queue item(s)" / "@bot mention(s)"

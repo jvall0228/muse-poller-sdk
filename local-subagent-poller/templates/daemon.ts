@@ -21,9 +21,11 @@
 //                           BACKOFF_STEPS[0].
 //   {{SLOW_CYCLE_MS}}     — slow-cycle threshold, e.g. 5000
 //   {{MAX_FAILURES}}      — consecutive failed cycles before the daemon
-//                           gives up and exits non-zero, e.g. 5. An auth
-//                           error exits immediately, without waiting for
-//                           this count.
+//                           gives up and exits non-zero, e.g. 5. A 401 exits
+//                           immediately, without waiting for this count. One
+//                           channel failing this many cycles in a row while
+//                           others succeed writes an error marker but does
+//                           not exit.
 //   {{CHANNELS}}          — the channel list (id + name), verified against
 //                           the source
 //   {{FETCH_IMPORT}}      — the fetch import, e.g.
@@ -46,7 +48,15 @@
 //   channel fails in one cycle (e.g. a 401 on every read), that cycle
 //   counts as a failure: the heartbeat is not written, and after
 //   {{MAX_FAILURES}} such cycles in a row the daemon writes an error
-//   marker and exits non-zero. An auth error exits immediately.
+//   marker and exits non-zero. A 401 (credential-wide) exits immediately;
+//   an auth error on every channel in one cycle does too. A channel that
+//   fails {{MAX_FAILURES}} cycles in a row while others succeed (often
+//   missing access to that one channel) gets a channel-warning.json marker
+//   naming it, and the daemon keeps running. This is deliberately NOT
+//   error.json: error.json means the daemon gave up and must be restarted.
+// - The fetch layer must attach the HTTP status to the errors it throws
+//   (e.g. `Object.assign(new Error(msg), { status })`); isAuthError reads
+//   `e.status`, never the message text.
 // - Rate-limit retry lives in the fetch layer ({{FETCH_IMPORT}}), not here.
 //   This loop only does failure backoff (minutes) and slow-cycle logging.
 // - First sight of a channel baselines its high-water mark and queues
@@ -60,12 +70,14 @@
 // an expired or revoked credential raises an auth error (see isAuthError),
 // and the daemon exits non-zero rather than retrying forever.
 //
-// Starting the daemon: start it from agent context (a tool call, a cron,
-// or a hook) — never from systemd. The egress proxy credential rotates per
-// tool call, so a systemd service can never hold a current credential and
-// its daemons fail to reach the network (proven Nov 13). A long-running
-// daemon keeps working on the credential it started with; recovery after a
-// VM replacement needs an agent-context mechanism, not a systemd unit.
+// Starting the daemon: a supervised service (systemd, launchd) is fine in
+// normal environments. Only where network credentials are scoped to an
+// agent's tool call (for example an egress-proxy credential that rotates per
+// call) must the daemon be started from agent context (a tool call, a cron,
+// or a hook), because a service cannot hold a current credential there. A
+// long-running daemon keeps working on the credential it started with; in
+// such environments, recovery after the host is replaced needs an
+// agent-context mechanism.
 
 {{FETCH_IMPORT}}
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, unlinkSync, openSync, closeSync, fsyncSync } from "node:fs";
@@ -81,6 +93,7 @@ const STATE_DIR = `${process.env.HOME}/hooks/state/{{STATE_DIR_NAME}}`;
 const QUEUE_FILE = `${STATE_DIR}/{{QUEUE_NAME}}`;
 const LAST_SEEN_FILE = `${STATE_DIR}/last-seen.json`;
 const ERROR_FILE = `${STATE_DIR}/error.json`;
+const WARN_FILE = `${STATE_DIR}/channel-warning.json`; // a channel keeps failing; daemon still running
 const PID_FILE = `${STATE_DIR}/daemon.pid`;
 const STOP_FILE = `${process.env.HOME}/hooks/state/{{STOP_FILE_NAME}}`;
 
@@ -121,8 +134,9 @@ function loadLastSeen(): LastSeen {
 function saveLastSeen(ls: LastSeen) {
   // Heartbeat: written on EVERY successful cycle, not only when items were
   // queued. The worker's liveness check reads `polled_at` — a file whose
-  // polled_at is older than 2x the poll interval means the daemon is dead,
-  // even if the channel cursors are unchanged on a quiet source. Never
+  // polled_at is stale past the worker's threshold (poll interval + first
+  // backoff step + call timeout) means the daemon is dead, even if the
+  // channel cursors are unchanged on a quiet source. Never
   // call this after an all-channels-failed cycle: that would keep
   // polled_at fresh while the daemon is effectively dead.
   mkdirSync(STATE_DIR, { recursive: true });
@@ -132,7 +146,7 @@ function saveLastSeen(ls: LastSeen) {
   });
 }
 
-function writeError(kind: string, detail: unknown) {
+function writeError(kind: string, detail: unknown, extra: Record<string, unknown> = {}) {
   // Error marker the worker's liveness check can read. Written when the
   // daemon gives up (auth error, or MAX_FAILURES in a row) before it exits
   // non-zero. Removed on the next successful start.
@@ -140,6 +154,7 @@ function writeError(kind: string, detail: unknown) {
   atomicWriteJson(ERROR_FILE, {
     kind,
     detail: String(detail).slice(0, 500),
+    ...extra,
     at: new Date().toISOString(),
   });
 }
@@ -187,22 +202,31 @@ function takeDaemonLock() {
   process.on("SIGTERM", () => process.exit(0));
 }
 
+// Credential-wide failure: a 401 means the credential itself is expired or
+// revoked, whichever channel hit it. Decide on the status the fetch layer
+// attaches to the error, never on substrings of the message (ids,
+// timestamps and URLs contain "401").
+function isCredentialError(e: unknown): boolean {
+  return (e as any)?.status === 401;
+}
+
 function isAuthError(e: unknown): boolean {
-  // Return true when the exception is an auth/permanent failure (a 401 or
-  // 403 from the source, an expired or revoked credential) — the daemon
-  // exits non-zero on those instead of retrying forever. A simple default
-  // is to match "401" or "403" in the exception message.
-  const s = String(e);
-  return s.includes("401") || s.includes("403");
+  // Return true when the exception is an auth/permanent failure. Add 403
+  // here only where the source documents it as an auth failure; many APIs
+  // use 403 for rate limits or for missing access to one channel, which
+  // must not take the daemon down (see main for how it is handled).
+  return isCredentialError(e);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (s: string) => console.log(`[${new Date().toISOString()}] ${s}`);
 
-async function pollOnce(lastSeen: LastSeen, dryRun: boolean): Promise<{ next: LastSeen; failedChannels: number; authError: unknown | null }> {
+async function pollOnce(lastSeen: LastSeen, dryRun: boolean): Promise<{ next: LastSeen; failedChannels: number; failedIds: Set<string>; authError: unknown | null; credentialError: unknown | null }> {
   const next: LastSeen = { ...lastSeen };
   let failedChannels = 0;
+  const failedIds = new Set<string>();
   let authError: unknown | null = null;
+  let credentialError: unknown | null = null;
   for (const ch of CHANNELS) {
     try {
       const after = lastSeen[ch.id];
@@ -210,7 +234,12 @@ async function pollOnce(lastSeen: LastSeen, dryRun: boolean): Promise<{ next: La
         ? `/channels/${ch.id}/messages?limit=25&after=${after}`
         : `/channels/${ch.id}/messages?limit=10`;
       const msgs = (await {{FETCH_CALL}}) as any[];
-      if (!Array.isArray(msgs) || msgs.length === 0) continue;
+      // A non-array body (e.g. an error object) is a failure for this
+      // channel, not an empty success. An empty array is a quiet success.
+      if (!Array.isArray(msgs)) {
+        throw Object.assign(new Error("unexpected non-array response"), { status: (msgs as any)?.status });
+      }
+      if (msgs.length === 0) continue;
       // Source returns newest-first; process oldest-first so the queue stays in order.
       const ordered = [...msgs].reverse();
       const newest = ordered[ordered.length - 1].id;
@@ -246,11 +275,13 @@ async function pollOnce(lastSeen: LastSeen, dryRun: boolean): Promise<{ next: La
       // stall the others — but they are COUNTED, not swallowed. The caller
       // treats an all-channels-failed cycle as a cycle failure.
       failedChannels++;
+      failedIds.add(ch.id);
       if (isAuthError(e)) authError = e;
+      if (isCredentialError(e)) credentialError = e;
       log(`#${ch.name} poll failed: ${e.message}`);
     }
   }
-  return { next, failedChannels, authError };
+  return { next, failedChannels, failedIds, authError, credentialError };
 }
 
 async function main() {
@@ -269,6 +300,7 @@ async function main() {
     `${POLL_MS / 1000}s ±${POLL_JITTER_MS / 1000}s jitter (stop file: {{STOP_FILE_NAME}})`);
   let lastSeen = loadLastSeen();
   let consecutiveFailures = 0;
+  const channelFailures: Record<string, number> = {};
   while (true) {
     if (existsSync(STOP_FILE)) {
       log("stop file present — exiting");
@@ -276,15 +308,35 @@ async function main() {
     }
     const cycleStart = Date.now();
     try {
-      const { next, failedChannels, authError } = await pollOnce(lastSeen, false);
-      if (authError) {
+      const { next, failedChannels, failedIds, authError, credentialError } = await pollOnce(lastSeen, false);
+      // Exit at once only for a credential-wide failure (a 401 on any
+      // channel) or when an auth error hit every channel in the cycle. An
+      // auth-class error (e.g. a documented 403) on just some channels
+      // usually means missing access to those channels, so the others keep
+      // being served and the per-channel counter below reports it.
+      if (credentialError || (authError && failedChannels === CHANNELS.length)) {
         // A permanent failure (expired/revoked credential) will never
         // succeed by retrying. Mark it and exit non-zero so the worker's
         // liveness check notices instead of the daemon sitting in `ps`
         // looking alive while nothing is ever queued.
-        writeError("auth", authError);
+        writeError("auth", credentialError ?? authError);
         log("auth error — exiting (check the credential)");
         process.exit(1);
+      }
+      // Per-channel consecutive failures: a channel that keeps failing
+      // while others succeed is flagged (channel-warning.json) but does not stop
+      // the daemon.
+      for (const ch of CHANNELS) {
+        channelFailures[ch.id] = failedIds.has(ch.id) ? (channelFailures[ch.id] ?? 0) + 1 : 0;
+        if (channelFailures[ch.id] === MAX_FAILURES && failedChannels < CHANNELS.length) {
+          log(`#${ch.name} failed ${MAX_FAILURES} cycles in a row — channel-warning.json written, daemon keeps running`);
+        }
+      }
+      const failing = CHANNELS.filter((ch) => (channelFailures[ch.id] ?? 0) >= MAX_FAILURES).map((ch) => ch.name);
+      if (failing.length > 0 && failedChannels < CHANNELS.length) {
+        atomicWriteJson(WARN_FILE, { kind: "channel_failing", channels: failing, at: new Date().toISOString() });
+      } else if (failing.length === 0 && existsSync(WARN_FILE)) {
+        try { unlinkSync(WARN_FILE); } catch {} // the failing channel(s) recovered
       }
       if (failedChannels === CHANNELS.length) {
         // Every channel failed (e.g. a 401 on every read): the daemon is
