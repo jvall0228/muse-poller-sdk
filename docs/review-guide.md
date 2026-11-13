@@ -4,9 +4,9 @@ For anyone reviewing this SDK before adopting it. What to check, in order of imp
 
 ## How to review it
 
-1. **Read the skill first** (`local-subagent-poller/SKILL.md`, ~110 lines). It is the contract: the two shapes, the pieces, the workflow, the operating rules, the measured latencies, the output contract.
-2. **Read the design doc** (`docs/design.md`) for why each rule exists and what failure motivated it.
-3. **Read the verification doc** (`docs/verification.md`) for what was found by adversarial review and how each fix was verified.
+1. **Read the skill first** (`local-subagent-poller/SKILL.md`). It is the build contract: the two shapes, the pieces, the `Source` interface and config schema, the workflow, the operating rules, the output contract.
+2. **Read the design doc** (`docs/design.md`) for each mechanism and the failure behind each rule.
+3. **Read the verification doc** (`docs/verification.md`) for what was found by adversarial review, and run the checks in the `README.md` ("Running the checks").
 4. **Spot-check one template against its production ancestor** (see "Template fidelity" below). Do not trust the skill's claim that every line traces — verify one.
 5. **Check the open questions** at the end of this guide and decide whether each is acceptable, needs a fix, or needs a second implementation before adoption.
 
@@ -16,9 +16,9 @@ For anyone reviewing this SDK before adopting it. What to check, in order of imp
 
 Every template line should trace to one of the instances in `local-subagent-poller/references/instances.md`, or to a reviewed template-only change recorded in the CHANGELOG or `docs/decisions.md`. Spot-check:
 
-- `templates/hook-watch.sh` vs the production wake scripts (chat mentions, team chat queue). The logic body should match apart from placeholders and the recorded template-only changes. The seen_absent branch, the worker-lock check, and the cursor-based outstanding rule are the load-bearing parts — confirm all three are present and in the right order.
-- `templates/daemon.py` vs a production team-queue watcher. Confirm the baseline branch only marks baselined when messages were seen, the backoff indexes `consecutive_failures - 1`, state writes are atomic (temp + fsync + rename), the daemon takes a single-instance lock, and an auth error writes an error marker and exits non-zero.
-- `templates/daemon.ts` vs a production chat-mentions watcher. Confirm the per-channel cursor advances per message after its append succeeds, the first-sight baseline, and that per-channel failures are counted — an all-channels-failed cycle is a cycle failure and the heartbeat is not written after one.
+- `templates/hook-watch.sh` vs the production wake scripts (chat mentions, team chat queue). The logic body should match apart from placeholders and the recorded changes. The seen_absent branch, the worker-lock check, and the cursor-based outstanding rule are the load-bearing parts — confirm all three are present and in the right order.
+- `templates/daemon.py` and `templates/daemon.ts` are modules with source adapters (since 1.1.0), not templates with placeholders, so fidelity is checked on the loop logic, not on filled-in values, and `tests/daemon` pins it. Against the production watchers (a team-queue Python watcher, a chat-mentions TS watcher), confirm: the baseline branch only marks a channel baselined when items were seen; the backoff indexes `consecutive_failures - 1`; a channel's cursor moves only after its whole batch is appended; per-channel failures are counted, an all-channels-failed cycle is a cycle failure and the heartbeat is not written after one; state writes are atomic; a single-instance lock is taken; an auth error (status 401) writes an error marker and exits non-zero. Then review the example adapter and config as the only per-source surface.
+- `templates/lock-holder.sh` and `templates/rotate-queue.sh` are new in 1.1.0 and have no production ancestor beyond the inline lock one-liner they replace; `tests/hook/run.sh` is their evidence.
 - `templates/worker-brief.md` vs the two production briefs. It is a synthesis, not a copy — confirm the structure (loop / alive file / stop file / exit report) is verbatim and the per-task rules are placeholders, not invented rules.
 - `templates/router-brief.md` and `templates/slice-worker-brief.md` vs the live-game orchestrator skill. These are the only Shape B evidence — confirm the routing-table and slice-ownership placeholders are genuinely per-project, not game-specific rules smuggled in as generic.
 
@@ -39,13 +39,15 @@ For each operating rule in the skill, ask: what failure would happen without it?
 - Discord warm reply: ~23s end-to-end. The Discord cold start is *unmeasured* — do not quote a cold-start number for Discord.
 - The skill's "post → wake ≤120s" bound (daemon ≤60s + hook ≤60s) is a bound, not a measurement. The measured post → wake was 53s (second canary: daemon 18s + hook 35s).
 
-### 4. The placeholders — can a fresh agent fill them?
+### 4. The placeholders and the adapter — can a fresh agent fill them?
 
-Pick one template and fill every `{{...}}` placeholder for a hypothetical poller. Check:
+The daemons have no placeholders. For the hook and the briefs, pick one template and fill every `{{...}}` placeholder for a hypothetical poller (the cross-template ones are listed in `local-subagent-poller/SKILL.md`). Check:
 
-- Every placeholder is defined (in the template's header comment or the skill). The worker-brief template's definitions sit at the top; the daemon templates' in their docstrings.
-- No placeholder is ambiguous: `{{POLL_SECS}}` must be a bare integer, `{{TASK_JQ}}` is a jq filter, `{{ROUTING_TABLE}}` is a complete event-type → queue map.
-- No placeholder is decorative: `{{HOOK_NAME}}` was removed for exactly this reason (documented but never instantiated).
+- Every placeholder is defined in the template's header comment or the SKILL's placeholder table.
+- No placeholder is ambiguous: `{{TASK_JQ}}` is a jq filter returning identifiers only, `{{ROUTING_TABLE}}` is a complete event-type to queue map.
+- No placeholder is decorative: `{{HOOK_NAME}}` was removed for exactly this reason.
+
+Then write a source adapter and config from `example_http_adapter.py` (or the TS one) for a hypothetical source, using only the SKILL's interface and config tables, and run the daemon with `--config`.
 
 ### 5. The usage skill — does it cover operating, not scaffolding?
 
@@ -56,7 +58,7 @@ Pick one template and fill every `{{...}}` placeholder for a hypothetical poller
 1. **Shape B is proven by one instance.** The orchestrator shape is extracted from a live game session alone. The skill marks it proven-by-one. A second orchestrator-style build is what would confirm the generalization. Acceptable for now, but do not present Shape B as battle-tested.
 2. **Scribe polls at 15s, slower than its producers.** The live game session's scribe can lag a dispatch by up to 15s. The instances file notes it. It is a latency cost, not a correctness bug — but a new orchestrator should not copy the 15s rate without that cost in mind.
 3. **Per-channel failures are now counted (fixed in 1.0.1).** Per-channel errors used to be swallowed inside `pollOnce`, so the outer backoff only fired on whole-cycle failures. The TS template now counts them: an all-channels-failed cycle is a cycle failure, the heartbeat is not written after one, and the daemon exits after N in a row. One bad channel still must not stall the others — that part is unchanged.
-4. **Template-only fixes.** Some fixes (lock, heartbeat, atomic writes, auth exit, and the 1.0.2 lock-release and auth-status changes) are recorded in the CHANGELOG as template-only: existing pollers built from earlier versions need the same changes applied before they benefit.
+4. **Template-only fixes.** Fixes recorded in the CHANGELOG as template-only (1.0.1 and 1.0.2, and the 1.1.0 breaking changes) do not reach pollers built from earlier versions until the same changes are applied there.
 5. **The stop-file + hook interaction.** The hook does not check the stop file, so a wake after the stop file is touched spawns a worker that exits immediately (one wasted cold start). Documented, not fixed — faithful to production. Decide whether a future version should have the hook check the stop file.
 6. **The Discord cold start is unmeasured.** Do not quote a Discord cold-start number until the owner's two test mentions run.
 

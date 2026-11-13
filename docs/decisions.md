@@ -70,7 +70,7 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 
 **Alternatives.** (a) Publish the local copy verbatim — rejected: the IDs are unnecessary and the server name identifies a private server. (b) Strip the instances file entirely — rejected: the instances are the evidence the templates trace to; a skill without evidence is an assertion.
 
-**Consequences.** The public and local copies diverge on identifiers and deployment-specific references. The divergence is documented here and is limited to the sanitized/genericized values (verified by grep: no identifiers, project names, ticket IDs, or private paths remain in the public copy). If the templates change, both copies must be updated — the local sync convention (two local copies kept identical) extends to the public copy's structure, not its identifiers.
+**Consequences.** The public and local copies diverge on identifiers and deployment-specific references. The divergence is documented here and is limited to the sanitized/genericized values (verified by `scripts/check-leaks.sh`: no home paths, emails, chat-style IDs, or ticket keys remain, plus any terms in a local `.leak-terms` file). If the templates change, both copies must be updated — the local sync convention (two local copies kept identical) extends to the public copy's structure, not its identifiers.
 
 ## ADR-8: The worker holds a lock; outstanding work is cursor-based
 
@@ -81,6 +81,8 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 **Alternatives.** (a) Lengthen the alive-file window above the worst-case turn — rejected: the window is a guess about turn length, and a long turn (a large upload) would still exceed it; the lock is sized to the worker's lifetime, not to a turn. (b) Keep the watermark and add spawn verification — rejected: verification surfaces a broken spawn, but the watermark still strands the items until the next new item; cursor-based outstanding retries once the startup window has passed.
 
 **Consequences.** The worker brief gains a lock-take/release step and the hook gains a `{{CURSOR}}` placeholder and a `woke_at` startup window. The hook no longer has a watermark at all. The alive file is now the operator's heartbeat and the holder's liveness signal, not the hook's.
+
+**Amended in 1.1.0 (see ADR-13).** The lock holder was first an inline shell one-liner in the worker brief. It is now `templates/lock-holder.sh` (`take`, `release`, `status`), which the brief calls through `{{SCRIPTS_DIR}}`; the semantics above are unchanged.
 
 ## ADR-9: Queued content is untrusted data; the wake payload carries identifiers only
 
@@ -100,7 +102,7 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 
 **Alternatives.** (a) Touch a separate heartbeat file instead of a `polled_at` field — considered equivalent; `polled_at` in `last-seen.json` was chosen so the liveness check reads one file. (b) Keep retrying auth errors with backoff — rejected: a permanent failure never succeeds by retrying, and the retry hides the outage. (c) Keep the in-place write and recover by re-baselining — rejected: re-baselining over history is silent data loss.
 
-**Consequences.** The daemon templates gain `{{MAX_FAILURES}}` and an `error.json` marker. The TS `last-seen.json` format becomes `{channels: {...}, polled_at: ...}` (the loader accepts the old plain-map format). The usage skill's health check reads `polled_at` and the error marker. Credentials are read from the environment or a secrets store — never hard-coded or committed, kept out of logs and queue lines, expiry handled as an auth error.
+**Consequences.** The daemons gain an `error.json` marker and a `max_failures` setting (a config key since 1.1.0, previously a `{{MAX_FAILURES}}` placeholder). `last-seen.json` becomes `{channels: {...}, polled_at: ...}` in both daemons (the loaders accept the older formats). The usage skill's health check reads `polled_at` and the error marker. Credentials are read from the environment or a secrets store — never hard-coded or committed, kept out of logs and queue lines, expiry handled as an auth error.
 
 ## ADR-11: Where the daemon starts depends on how credentials are scoped
 
@@ -111,3 +113,33 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 **Alternatives.** (a) A service with a credential-refreshing wrapper — rejected in that environment: there is no stable source for the wrapper to read. (b) Bake a long-lived credential into the unit — rejected: it would be a committed secret and would still expire.
 
 **Consequences.** In such environments, recovery after the host is replaced needs an agent-context mechanism (a recovery cron). The SDK documents the constraint, scoped to those environments, in the skill and in both daemon templates.
+
+## ADR-12: Daemons are modules with a source adapter and a JSON config
+
+**Decision.** `daemon.py` and `daemon.ts` are runnable modules that are copied unchanged. Source-specific code lives in an adapter implementing a four-method `Source` interface (`fetch`, `is_new`, `cursor_of`, `to_queue_item`, with `SourceError(msg, status)` for failures). Operational settings live in a JSON config file selected with `--config` or `POLLER_CONFIG`. TS timing config is in seconds, and the TS `QUEUE_NAME` setting is gone (the queue is `queue.jsonl`).
+
+**Context.** Through 1.0.2 the daemons were templates with `{{...}}` placeholders edited in place. Each poller forked the loop, so the load-bearing rules (baseline, backoff, no-overlap, atomic writes, auth exit) drifted per copy, and nothing could be tested without filling a template first.
+
+**Alternatives.** (a) Keep templates and add tests that fill them first — rejected: the tests would exercise a filled copy, not what ships. (b) A plugin framework with discovery and lifecycle hooks — rejected: four methods and a dotted path or relative path are enough. (c) Environment variables instead of a file — rejected: nested settings (channels, backoff steps, adapter options) need structure, and a file is reviewable.
+
+**Consequences.** Daemon logic has pytest and bun tests (`tests/daemon`). Reviewing a new poller means reading the adapter and the config. Breaking for pollers built from 1.0.x: the placeholders become config keys, TS timing moves from milliseconds to seconds, `QUEUE_NAME` is removed, and the Python `last-seen.json` changes shape (see `CHANGELOG.md`).
+
+## ADR-13: Lock script, queue lock and rotation
+
+**Decision.** The worker lock is `templates/lock-holder.sh` (`take`, `release`, `status`). Every append to a queue holds an exclusive `flock` on `queue.lock` in the queue's directory. `templates/rotate-queue.sh` archives a fully consumed queue under that lock, resets the cursor to 0, and keeps the newest N archives. The hook reads line count and cursor under a non-blocking shared `flock` on `queue.lock` and treats `cursor > lines` or a non-numeric cursor as 0. Mechanisms: `docs/design.md`, "Queue protocol" and "Worker lock".
+
+**Context.** The lock holder was an inline one-liner in the worker brief, copied and hand-edited per poller, and the queue grew without bound because there was no safe way to archive it: a rotation racing an append would lose a line.
+
+**Alternatives.** (a) Keep the inline one-liner — rejected: it could not be tested or shellchecked, and its release path (killing `flock`) was the 1.0.2 bug. (b) Rotate without a lock and rely on timing — rejected: a lost line is silent data loss. (c) Make the hook block on the lock — rejected: a blocked hook delays every other poll; skipping one poll as "queue busy" costs a minute.
+
+**Consequences.** Producers must append under the lock (the daemons do; the router and slice briefs say so). `flock(1)` is now needed by the TS daemon, rotation and the hook's read. Briefs gain `{{SCRIPTS_DIR}}`. The scripts are covered by `tests/hook/run.sh` and shellcheck.
+
+## ADR-14: Daemon and script logs are JSON lines on stderr
+
+**Decision.** Daemons and the two scripts log one JSON object per line on stderr: `{"ts", "level", "event", ...}`. Fields carry channel and item ids only, never message text or usernames.
+
+**Context.** The daemons logged free-form lines, so the operator's health check grepped prose ("baseline at ts ...") and a format tweak broke it; the 1.0.1 privacy fix had to audit every format string.
+
+**Alternatives.** (a) Keep prose logs — rejected for the reasons above. (b) A logging library — rejected: the daemons are standard-library only.
+
+**Consequences.** Logs are filterable with `jq`. Anything that grepped the old prose lines must match on `event` names instead (for example `baseline`).

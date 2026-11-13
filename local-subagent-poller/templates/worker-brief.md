@@ -25,6 +25,9 @@
                               alive)
      {{LOCK_STALE_SECS}}   — how stale the alive file may be before the
                               lock holder exits by itself, e.g. 900
+     {{SCRIPTS_DIR}}       — absolute path to the directory holding
+                              lock-holder.sh and rotate-queue.sh (copy them
+                              from templates/ next to the brief)
      {{STOP_FILE}}         — absolute path to the stop file
      {{OWNER_ID}}          — the owner's verified author id in the source
                               (never a display name)
@@ -63,7 +66,8 @@ Consume `{{QUEUE_PATH}}` every {{POLL_INTERVAL}} — the same rate the
 daemon polls the source. The worker can never see new work faster than the
 daemon delivers it, so polling faster only wastes cycles.
 Track your position in `{{CURSOR_PATH}}` (a line count — advance it only
-after a task is fully handled).
+after a task is fully handled). If the cursor is greater than the queue's
+line count, the queue was rotated: treat the cursor as 0.
 
 **Every iteration, touch the alive file** so the operator (and the lock
 holder) can see you are here:
@@ -79,33 +83,34 @@ file you touch between turns would go stale mid-task and wake a second
 worker on the same cursor. Start a holder that keeps the lock for your
 whole lifetime and exits by itself if you stop touching the alive file:
 
-Needs `flock(1)` (util-linux; on macOS install it separately). If
-`command -v flock` fails, exit and report "flock not installed" — do not
-process the queue.
+Needs `flock(1)` (util-linux; on macOS install it separately). Take the
+lock with the helper script; it starts a background holder that keeps the
+lock until you release it or stop touching the alive file for
+{{LOCK_STALE_SECS}}s:
 
 ```
-LOCK={{LOCKFILE}}; ALIVE={{ALIVE_PATH}}; HOLDER_PID=
-for i in 1 2 3; do
-  flock -n $LOCK -c "rm -f $LOCK.release; while [ ! -e $LOCK.release ] && [ \$(( \$(date +%s) - \$(stat -c %Y $ALIVE 2>/dev/null || stat -f %m $ALIVE 2>/dev/null || echo 0) )) -le {{LOCK_STALE_SECS}} ]; do sleep 2; done" &
-  HOLDER_PID=$!; sleep 1
-  kill -0 $HOLDER_PID 2>/dev/null && break
-  HOLDER_PID=
-done
-[ -n "$HOLDER_PID" ] || { echo "lock held by another worker — exiting"; exit 1; }
+{{SCRIPTS_DIR}}/lock-holder.sh take --lock {{LOCKFILE}} --alive {{ALIVE_PATH}} --stale {{LOCK_STALE_SECS}}
 ```
 
-(`stat -c %Y` is GNU; the `|| stat -f %m` fallback is BSD/macOS. The
-`-n` makes each take non-blocking: if another worker holds the lock, the
-holder exits at once and the `kill -0` check catches it. The take is
-retried up to 3 times, 1s apart, because the hook probes the lock for an
-instant with `flock -n FILE -c true` and can collide with it. If all
-three fail, exit immediately and report it; do not process the queue.)
-The holder ends when the release file `{{LOCKFILE}}.release` appears, or
-when the alive file goes stale. **On exit, release the lock** — do not
-`kill` the holder, since its child shell would keep the lock:
-`touch {{LOCKFILE}}.release; for i in 1 2 3 4 5 6 7 8 9 10; do flock -n {{LOCKFILE}} -c true 2>/dev/null && break; sleep 1; done; rm -f {{LOCKFILE}}.release`.
-If you die abruptly, the holder exits by itself once the alive file goes
-stale past {{LOCK_STALE_SECS}}s, so a replacement is not blocked forever.
+Exit 0 means you hold the lock. Exit 1 means another worker holds it —
+exit immediately and report it; do not process the queue. Exit 3 means
+`flock` is not installed — exit and report that. **On exit, release the
+lock** (never `kill` the holder):
+`{{SCRIPTS_DIR}}/lock-holder.sh release --lock {{LOCKFILE}}`.
+`lock-holder.sh status --lock {{LOCKFILE}} --alive {{ALIVE_PATH}}` prints
+one JSON line if you need to check. If you die abruptly, the holder exits
+by itself once the alive file goes stale, so a replacement is not blocked.
+
+**When you have caught up** (cursor equals the queue's line count), rotate
+the queue so it does not grow forever. It does nothing unless the queue is
+large enough:
+
+```
+{{SCRIPTS_DIR}}/rotate-queue.sh --queue {{QUEUE_PATH}} --cursor {{CURSOR_PATH}} --lock {{STATE_DIR}}/queue.lock
+```
+
+Only run it while you hold the worker lock. It archives the queue, resets
+the cursor to 0 and prunes old archives.
 
 Check `{{STOP_FILE}}` every iteration. If it exists, exit and report:
 tasks processed, actions taken, items skipped (one line each on why), and

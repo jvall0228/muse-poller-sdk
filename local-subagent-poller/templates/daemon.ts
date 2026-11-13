@@ -1,74 +1,69 @@
 #!/usr/bin/env bun
-// {{DAEMON_NAME}} (tier 1 daemon, bun/TS) — TEMPLATE.
-// Extracted from the production Discord mention watcher (Nov 13 2026).
-// Use this template for a Discord-like source (REST polling, per-channel
-// cursors, a fetch layer with 429 retry). For a Python/CLI source use
-// templates/daemon.py instead. Copy into the new poller's directory and
-// fill in the {{...}} placeholders. Keep the structure verbatim — the
-// baseline, per-channel cursor, no-overlap, and slow-cycle rules are
-// load-bearing.
+// Tier 1 poller daemon (bun/TypeScript) - a runnable module, not a snippet.
 //
-// Fill in ({{POLL_MS}} is a bare integer in milliseconds, e.g. 10000):
-//   {{DAEMON_NAME}}       — e.g. "Discord mention watcher"
-//   {{SOURCE_DESCRIPTION}}— one line: what it polls, e.g. "<your server> only"
-//   {{STATE_DIR_NAME}}    — state dir name under ~/hooks/state/
-//   {{STOP_FILE_NAME}}    — stop file name under ~/hooks/state/
-//   {{QUEUE_NAME}}        — queue file name, e.g. "mentions.jsonl"
-//   {{POLL_MS}}           — poll interval in ms, e.g. 10000
-//   {{POLL_JITTER_MS}}    — jitter on the sleep, e.g. 2000
-//   {{BACKOFF_STEPS_MS}}  — e.g. [10000, 30000, 60000, 300000]. Cap, reset
-//                           on success. The first failure sleeps
-//                           BACKOFF_STEPS[0].
-//   {{SLOW_CYCLE_MS}}     — slow-cycle threshold, e.g. 5000
-//   {{MAX_FAILURES}}      — consecutive failed cycles before the daemon
-//                           gives up and exits non-zero, e.g. 5. A 401 exits
-//                           immediately, without waiting for this count. One
-//                           channel failing this many cycles in a row while
-//                           others succeed writes an error marker but does
-//                           not exit.
-//   {{CHANNELS}}          — the channel list (id + name), verified against
-//                           the source
-//   {{FETCH_IMPORT}}      — the fetch import, e.g.
-//                           `import { discordFetch } from ".../lib/rest.ts"`
-//   {{FETCH_CALL}}        — the fetch call (the `path` variable is in scope),
-//                           e.g. `discordFetch(path, { as: "bot" })`
-//   {{BOT_ID}}            — the bot's own id (never answer its own lines)
-//   {{IS_NEW}}            — the per-message filter, e.g.
-//                           `const mentionsBot = (m.mentions || []).some((u) => u.id === BOT_ID); if (!mentionsBot) continue;`
-//   {{QUEUE_ITEM}}        — the queue line shape. Include every field the
-//                           worker's decision rules need (who it is for,
-//                           channel, author, timestamp) — a minimal shape
-//                           forces the worker to re-fetch per item.
-//   {{DRY_RUN_FLAG}}      — the dry-run argv check, e.g. `Bun.argv.includes("--dry-run")`
-//   {{SOURCE_TYPE}}       — e.g. "Discord"
+// Use this for a REST-polling source with per-channel cursors (a chat-style
+// API). For a Python/CLI source use templates/daemon.py. Copy this file,
+// poller.config.example.ts.json and an adapter into the new poller's
+// directory, edit the config, write (or adapt) the adapter, run:
+//
+//   bun daemon.ts --config poller.config.json      # or POLLER_CONFIG=...
+//   bun daemon.ts --config poller.config.json --dry-run   # one cycle, writes nothing
+//
+// Everything source-specific lives in the adapter; everything operational
+// (timing, backoff, state files, locks, logs) lives here. The baseline,
+// per-channel cursor, no-overlap and slow-cycle rules are load-bearing.
+//
+// Config (JSON; all times in seconds):
+//   name                 display name used in the start log
+//   state_dir_name       state dir name under <state_root>/
+//   stop_file_name       stop file name under <state_root>/
+//   poll_secs            poll interval (10 fast API, 60 slow/quiet API)
+//   poll_jitter_secs     jitter on the sleep
+//   backoff_steps_secs   e.g. [10, 30, 60, 300]; capped, reset on success;
+//                        the first failure sleeps backoff_steps_secs[0]
+//   slow_call_secs       slow-cycle log threshold
+//   call_timeout_secs    timeout for one source call; must be <= poll_secs.
+//                        The adapter enforces it (it receives the config).
+//   max_failures         consecutive failed cycles before giving up
+//                        (error.json, exit non-zero). A 401 exits at once.
+//                        One channel failing this many cycles in a row while
+//                        others succeed writes channel-warning.json but does
+//                        not exit.
+//   channels             [{"id": ..., "name": ...}, ...] - at least one
+//   adapter              path (./relative to the config file, or absolute) or
+//                        module specifier; must export makeSource(config)
+//   adapter_options      optional object, free-form, read by the adapter
+//   state_root           optional, default ~/hooks/state (env
+//                        POLLER_STATE_ROOT overrides the default)
+//   queue_lock_wait_secs optional, default 30: how long an append waits for
+//                        queue.lock before the cycle counts as failed
 //
 // Notes:
 // - Per-channel errors are caught inside pollOnce so one bad channel does
-//   not stall the others — but they are COUNTED, not swallowed. If every
-//   channel fails in one cycle (e.g. a 401 on every read), that cycle
-//   counts as a failure: the heartbeat is not written, and after
-//   {{MAX_FAILURES}} such cycles in a row the daemon writes an error
-//   marker and exits non-zero. A 401 (credential-wide) exits immediately;
-//   an auth error on every channel in one cycle does too. A channel that
-//   fails {{MAX_FAILURES}} cycles in a row while others succeed (often
-//   missing access to that one channel) gets a channel-warning.json marker
-//   naming it, and the daemon keeps running. This is deliberately NOT
-//   error.json: error.json means the daemon gave up and must be restarted.
-// - The fetch layer must attach the HTTP status to the errors it throws
-//   (e.g. `Object.assign(new Error(msg), { status })`); isAuthError reads
-//   `e.status`, never the message text.
-// - Rate-limit retry lives in the fetch layer ({{FETCH_IMPORT}}), not here.
-//   This loop only does failure backoff (minutes) and slow-cycle logging.
+//   not stall the others - but they are COUNTED, not swallowed. If every
+//   channel fails in one cycle (e.g. a 401 on every read) that cycle counts
+//   as a failure: the heartbeat is not written, and after max_failures such
+//   cycles in a row the daemon writes error.json and exits non-zero. A 401
+//   (credential-wide) exits immediately; an auth error on every channel in
+//   one cycle does too. A channel failing max_failures cycles in a row while
+//   others succeed gets channel-warning.json and the daemon keeps running.
+//   This is deliberately NOT error.json: error.json means the daemon gave up
+//   and must be restarted.
+// - Adapters throw SourceError(message, status). isAuthError reads
+//   `status`, never the message text. Rate-limit retry lives in the adapter.
 // - First sight of a channel baselines its high-water mark and queues
 //   nothing. An empty first poll stays unbaselined for that channel.
-// - Logs carry channel and message id only — never a username or message
-//   text. The queue lines hold the content; the log is not the place for it.
+// - Logs are JSON lines on stderr and carry channel and item id only -
+//   never a username or message text. Queue lines hold the content.
+// - Queue appends hold an exclusive flock on <state_dir>/queue.lock and open
+//   queue.jsonl by path for each batch. Bun has no flock, so each batch is
+//   appended by flock(1) (util-linux), which interoperates with a bash
+//   rotator: `flock queue.lock sh -c 'cat >> "$1"' _ queue.jsonl`.
 //
-// Credentials: read the source token from the environment or a secrets
-// store — never hard-code it in the filled-in template and never commit
-// it. Keep it out of logs and queue lines, and handle expiry explicitly:
-// an expired or revoked credential raises an auth error (see isAuthError),
-// and the daemon exits non-zero rather than retrying forever.
+// Credentials: read the source token from the environment or a secrets store
+// inside the adapter - never hard-code it, never commit it, keep it out of
+// logs and queue lines. An expired or revoked credential is a 401
+// SourceError; the daemon exits non-zero rather than retrying forever.
 //
 // Starting the daemon: a supervised service (systemd, launchd) is fine in
 // normal environments. Only where network credentials are scoped to an
@@ -79,32 +74,206 @@
 // such environments, recovery after the host is replaced needs an
 // agent-context mechanism.
 
-{{FETCH_IMPORT}}
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, unlinkSync, openSync, closeSync, fsyncSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync,
+  renameSync, unlinkSync, writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const BOT_ID = "{{BOT_ID}}"; // never answer its own lines
-const POLL_MS = {{POLL_MS}};
-const POLL_JITTER_MS = {{POLL_JITTER_MS}};
-// Backoff on consecutive failed cycles. Prevents hammering the source
-// during an outage or auth break.
-const BACKOFF_STEPS = {{BACKOFF_STEPS_MS}};
-const MAX_FAILURES = {{MAX_FAILURES}};
-const STATE_DIR = `${process.env.HOME}/hooks/state/{{STATE_DIR_NAME}}`;
-const QUEUE_FILE = `${STATE_DIR}/{{QUEUE_NAME}}`;
-const LAST_SEEN_FILE = `${STATE_DIR}/last-seen.json`;
-const ERROR_FILE = `${STATE_DIR}/error.json`;
-const WARN_FILE = `${STATE_DIR}/channel-warning.json`; // a channel keeps failing; daemon still running
-const PID_FILE = `${STATE_DIR}/daemon.pid`;
-const STOP_FILE = `${process.env.HOME}/hooks/state/{{STOP_FILE_NAME}}`;
+export type Item = Record<string, unknown>;
+export type Channel = { id: string; name: string };
 
-const CHANNELS: Array<{ id: string; name: string }> = {{CHANNELS}};
+export class SourceError extends Error {
+  status?: number;
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = "SourceError";
+    this.status = status;
+  }
+}
 
-type LastSeen = Record<string, string>; // channelId -> newest message id seen
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
 
-function atomicWriteJson(path: string, obj: unknown) {
-  // Write to a temp file in the same directory, fsync, then rename — so a
-  // crash or kill mid-write never leaves a truncated state file. The
-  // same-directory temp + atomic rename is the load-bearing half.
+export class LockError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LockError";
+  }
+}
+
+export type Config = {
+  name: string;
+  stateDirName: string;
+  stopFileName: string;
+  pollSecs: number;
+  pollJitterSecs: number;
+  backoffStepsSecs: number[];
+  slowCallSecs: number;
+  callTimeoutSecs: number;
+  maxFailures: number;
+  channels: Channel[];
+  adapter: string;
+  adapterOptions: Record<string, unknown>;
+  stateRoot: string;
+  queueLockWaitSecs: number;
+  baseDir: string;
+};
+
+/** The source adapter. Items are opaque to the daemon. */
+export interface Source {
+  /** Recent items, newest first. `since` is the channel cursor, or undefined
+   *  when there is none yet (return recent items unfiltered - the daemon
+   *  baselines from them and queues none). Throw SourceError on failure. */
+  fetch(channel: Channel, since: string | undefined): Promise<Item[]>;
+  /** Which items count as queue items. Filter the bot's own items and any
+   *  system items. */
+  isNew(item: Item, since: string | undefined): boolean;
+  /** The cursor value that marks this item as seen. */
+  cursorOf(item: Item): string;
+  /** The JSONL line per item. Include every field the worker's decision
+   *  rules need (who it is for, channel, author, timestamp). */
+  toQueueItem(channel: Channel, item: Item): Item;
+}
+
+// --------------------------------------------------------------------------
+// Config
+
+function num(o: Record<string, unknown>, key: string, min = 0, allowEqual = false): number {
+  const v = o[key];
+  if (typeof v !== "number" || !Number.isFinite(v)) throw new ConfigError(`config: ${key} must be a number`);
+  if (v < min || (v === min && !allowEqual)) {
+    throw new ConfigError(`config: ${key} must be ${allowEqual ? ">=" : ">"} ${min}`);
+  }
+  return v;
+}
+
+function plainName(o: Record<string, unknown>, key: string): string {
+  const v = o[key];
+  if (typeof v !== "string" || !v || v.includes("/") || v === "." || v === "..") {
+    throw new ConfigError(`config: ${key} must be a non-empty name without slashes`);
+  }
+  return v;
+}
+
+export function parseConfig(raw: unknown, baseDir = "."): Config {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ConfigError("config: top level must be a JSON object");
+  }
+  const o = raw as Record<string, unknown>;
+  if (typeof o.name !== "string" || !o.name) throw new ConfigError("config: name must be a non-empty string");
+  const pollSecs = num(o, "poll_secs");
+  const pollJitterSecs = num(o, "poll_jitter_secs", 0, true);
+  const slowCallSecs = num(o, "slow_call_secs");
+  const callTimeoutSecs = num(o, "call_timeout_secs");
+  if (callTimeoutSecs > pollSecs) {
+    throw new ConfigError("config: call_timeout_secs must be <= poll_secs (a call must not overlap the next cycle)");
+  }
+  const steps = o.backoff_steps_secs;
+  if (!Array.isArray(steps) || steps.length === 0 || steps.some((s) => typeof s !== "number" || !(s > 0))) {
+    throw new ConfigError("config: backoff_steps_secs must be a non-empty list of positive numbers");
+  }
+  const maxFailures = o.max_failures;
+  if (typeof maxFailures !== "number" || !Number.isInteger(maxFailures) || maxFailures < 1) {
+    throw new ConfigError("config: max_failures must be an integer >= 1");
+  }
+  const chans = o.channels;
+  if (!Array.isArray(chans) || chans.length === 0) {
+    throw new ConfigError("config: channels must be a non-empty list of {id, name}");
+  }
+  const channels: Channel[] = chans.map((c: unknown) => {
+    const ch = c as Record<string, unknown> | null;
+    if (!ch || typeof ch.id !== "string" || !ch.id || typeof ch.name !== "string" || !ch.name) {
+      throw new ConfigError("config: each channel needs a non-empty string id and name");
+    }
+    return { id: ch.id, name: ch.name };
+  });
+  if (new Set(channels.map((c) => c.id)).size !== channels.length) {
+    throw new ConfigError("config: channel ids must be unique");
+  }
+  if (typeof o.adapter !== "string" || !o.adapter) throw new ConfigError("config: adapter must be a module path string");
+  const options = o.adapter_options ?? {};
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new ConfigError("config: adapter_options must be an object");
+  }
+  if (o.state_root !== undefined && (typeof o.state_root !== "string" || !o.state_root)) {
+    throw new ConfigError("config: state_root must be a non-empty string");
+  }
+  let root = (o.state_root as string | undefined) ?? process.env.POLLER_STATE_ROOT ?? "~/hooks/state";
+  if (root === "~" || root.startsWith("~/")) root = join(homedir(), root.slice(1));
+  return {
+    name: o.name,
+    stateDirName: plainName(o, "state_dir_name"),
+    stopFileName: plainName(o, "stop_file_name"),
+    pollSecs,
+    pollJitterSecs,
+    backoffStepsSecs: steps as number[],
+    slowCallSecs,
+    callTimeoutSecs,
+    maxFailures,
+    channels,
+    adapter: o.adapter,
+    adapterOptions: options as Record<string, unknown>,
+    stateRoot: root,
+    queueLockWaitSecs: "queue_lock_wait_secs" in o ? num(o, "queue_lock_wait_secs") : 30,
+    baseDir,
+  };
+}
+
+export function loadConfig(path: string): Config {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    throw new ConfigError(`config: file not found: ${path}`);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new ConfigError(`config: invalid JSON in ${path}: ${(e as Error).message}`);
+  }
+  return parseConfig(raw, dirname(resolve(path)));
+}
+
+export async function loadSource(config: Config): Promise<Source> {
+  const spec = config.adapter;
+  const target = spec.startsWith(".") || isAbsolute(spec)
+    ? pathToFileURL(resolve(config.baseDir, spec)).href
+    : spec;
+  let mod: { makeSource?: unknown };
+  try {
+    mod = await import(target);
+  } catch (e) {
+    throw new ConfigError(`config: cannot import adapter ${JSON.stringify(spec)}: ${(e as Error).message}`);
+  }
+  if (typeof mod.makeSource !== "function") {
+    throw new ConfigError(`config: adapter ${JSON.stringify(spec)} does not export makeSource(config)`);
+  }
+  return await (mod.makeSource as (c: Config) => Source | Promise<Source>)(config);
+}
+
+// --------------------------------------------------------------------------
+// Paths, logging, state files, locks
+
+const stateDir = (c: Config) => join(c.stateRoot, c.stateDirName);
+const stopFile = (c: Config) => join(c.stateRoot, c.stopFileName);
+
+export type LogLevel = "info" | "warn" | "error";
+export function log(level: LogLevel, event: string, fields: Record<string, unknown> = {}): void {
+  process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), level, event, ...fields }) + "\n");
+}
+
+function atomicWriteJson(path: string, obj: unknown): void {
+  // Temp file in the same directory, fsync, then rename - so a crash or kill
+  // mid-write never leaves a truncated state file.
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, JSON.stringify(obj, null, 2));
   const fd = openSync(tmp, "r+");
@@ -113,72 +282,68 @@ function atomicWriteJson(path: string, obj: unknown) {
   renameSync(tmp, path);
 }
 
-function loadLastSeen(): LastSeen {
+type LastSeen = Record<string, string>; // channelId -> newest item cursor
+
+function loadLastSeen(c: Config): LastSeen {
   try {
-    if (existsSync(LAST_SEEN_FILE)) {
-      const parsed = JSON.parse(readFileSync(LAST_SEEN_FILE, "utf8"));
-      // Current format: {channels: {...}, polled_at: "..."}. Accept the
-      // old plain-map format too, so a filled-in template applied over an
-      // existing state file does not re-baseline.
+    const path = join(stateDir(c), "last-seen.json");
+    if (existsSync(path)) {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      // Current format: {channels: {...}, polled_at}. Accept the old plain
+      // map too, so applying this over an existing state file does not
+      // re-baseline.
       if (parsed && typeof parsed === "object" && parsed.channels && typeof parsed.channels === "object") {
         return parsed.channels as LastSeen;
       }
       if (parsed && typeof parsed === "object") {
-        const { polled_at, ...rest } = parsed;
+        const { polled_at: _ignored, ...rest } = parsed as Record<string, unknown>;
         return rest as LastSeen;
       }
     }
-  } catch {}
+  } catch {
+    // unreadable state: start unbaselined
+  }
   return {};
 }
-function saveLastSeen(ls: LastSeen) {
+
+function saveLastSeen(c: Config, ls: LastSeen): void {
   // Heartbeat: written on EVERY successful cycle, not only when items were
-  // queued. The worker's liveness check reads `polled_at` — a file whose
-  // polled_at is stale past the worker's threshold (poll interval + first
-  // backoff step + call timeout) means the daemon is dead, even if the
-  // channel cursors are unchanged on a quiet source. Never
-  // call this after an all-channels-failed cycle: that would keep
-  // polled_at fresh while the daemon is effectively dead.
-  mkdirSync(STATE_DIR, { recursive: true });
-  atomicWriteJson(LAST_SEEN_FILE, {
-    channels: ls,
-    polled_at: new Date().toISOString(),
-  });
+  // queued. The worker's liveness check reads `polled_at`. Never call this
+  // after an all-channels-failed cycle: that would keep polled_at fresh
+  // while the daemon is effectively dead.
+  mkdirSync(stateDir(c), { recursive: true });
+  atomicWriteJson(join(stateDir(c), "last-seen.json"), { channels: ls, polled_at: new Date().toISOString() });
 }
 
-function writeError(kind: string, detail: unknown, extra: Record<string, unknown> = {}) {
-  // Error marker the worker's liveness check can read. Written when the
-  // daemon gives up (auth error, or MAX_FAILURES in a row) before it exits
-  // non-zero. Removed on the next successful start.
-  mkdirSync(STATE_DIR, { recursive: true });
-  atomicWriteJson(ERROR_FILE, {
+function writeError(c: Config, kind: string, detail: unknown): void {
+  // Error marker the worker's liveness check reads. Written when the daemon
+  // gives up before it exits non-zero. Removed on the next start.
+  mkdirSync(stateDir(c), { recursive: true });
+  atomicWriteJson(join(stateDir(c), "error.json"), {
     kind,
-    detail: String(detail).slice(0, 500),
-    ...extra,
+    detail: String(detail instanceof Error ? detail.message : detail).slice(0, 500),
     at: new Date().toISOString(),
   });
 }
 
-function takeDaemonLock() {
-  // Only one daemon instance may run: two share the cursors and append
-  // every item twice. Bun has no fcntl.flock in its stdlib, so use an
-  // exclusive-create pidfile: create it with "wx", and if it already
-  // exists, check whether that pid is still alive — a dead pid means a
-  // crashed daemon, so remove the stale pidfile and retry once. Remove
-  // the pidfile on exit.
-  mkdirSync(STATE_DIR, { recursive: true });
+/** Single-instance lock: exclusive-create pidfile with a liveness check.
+ *  Returns a release function. Throws LockError if another live instance
+ *  holds it. */
+export function takeDaemonLock(c: Config): () => void {
+  const pidFile = join(stateDir(c), "daemon.pid");
+  mkdirSync(stateDir(c), { recursive: true });
   const writePid = () => {
-    const fd = openSync(PID_FILE, "wx");
+    const fd = openSync(pidFile, "wx");
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
   };
   try {
     writePid();
-  } catch (e: any) {
-    if (e?.code !== "EEXIST") throw e;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
     let stale = true;
     try {
-      const pid = parseInt(readFileSync(PID_FILE, "utf8").trim(), 10);
+      const pid = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
       if (Number.isFinite(pid)) {
         try {
           process.kill(pid, 0);
@@ -190,204 +355,257 @@ function takeDaemonLock() {
     } catch {
       stale = true;
     }
-    if (!stale) {
-      throw new Error("daemon pidfile held — another instance is running");
-    }
+    if (!stale) throw new LockError("daemon pidfile held - another instance is running");
     // Stale pidfile from a crashed daemon: remove and retry once.
-    try { unlinkSync(PID_FILE); } catch {}
+    try { unlinkSync(pidFile); } catch { /* already gone */ }
     writePid();
   }
-  process.on("exit", () => { try { unlinkSync(PID_FILE); } catch {} });
-  process.on("SIGINT", () => process.exit(0));
-  process.on("SIGTERM", () => process.exit(0));
+  return () => { try { unlinkSync(pidFile); } catch { /* already gone */ } };
+}
+
+/** Append one batch of JSON lines to queue.jsonl under queue.lock.
+ *  Opened by path per batch (via flock(1)) so a rotator's rename is picked
+ *  up; synced before the lock is released. */
+export function appendQueue(c: Config, lines: string[]): void {
+  mkdirSync(stateDir(c), { recursive: true });
+  const script = 'cat >> "$1" && { sync -d "$1" 2>/dev/null || sync; }';
+  const r = spawnSync(
+    "flock",
+    ["-w", String(c.queueLockWaitSecs), join(stateDir(c), "queue.lock"), "sh", "-c", script, "_",
+      join(stateDir(c), "queue.jsonl")],
+    { input: lines.map((l) => l + "\n").join(""), encoding: "utf8" },
+  );
+  if (r.error) throw new Error(`queue append failed: ${r.error.message}`);
+  if (r.status !== 0) {
+    throw new Error(`queue append failed (flock exit ${r.status}): ${String(r.stderr).trim().slice(0, 200)}`);
+  }
 }
 
 // Credential-wide failure: a 401 means the credential itself is expired or
-// revoked, whichever channel hit it. Decide on the status the fetch layer
-// attaches to the error, never on substrings of the message (ids,
-// timestamps and URLs contain "401").
+// revoked, whichever channel hit it. Decide on the status, never on
+// substrings of the message (ids, timestamps and URLs contain "401").
 function isCredentialError(e: unknown): boolean {
-  return (e as any)?.status === 401;
+  return (e as { status?: unknown } | null)?.status === 401;
 }
 
-function isAuthError(e: unknown): boolean {
-  // Return true when the exception is an auth/permanent failure. Add 403
-  // here only where the source documents it as an auth failure; many APIs
-  // use 403 for rate limits or for missing access to one channel, which
-  // must not take the daemon down (see main for how it is handled).
+export function isAuthError(e: unknown): boolean {
+  // Add 403 only where the source documents it as an auth failure; many APIs
+  // use 403 for rate limits or for missing access to one channel, which must
+  // not take the daemon down.
   return isCredentialError(e);
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const log = (s: string) => console.log(`[${new Date().toISOString()}] ${s}`);
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const errStatus = (e: unknown) => (e as { status?: unknown } | null)?.status ?? null;
 
-async function pollOnce(lastSeen: LastSeen, dryRun: boolean): Promise<{ next: LastSeen; failedChannels: number; failedIds: Set<string>; authError: unknown | null; credentialError: unknown | null }> {
+// --------------------------------------------------------------------------
+// Polling
+
+type PollResult = {
+  next: LastSeen;
+  queued: number;
+  failedChannels: number;
+  failedIds: Set<string>;
+  authError: unknown;
+  credentialError: unknown;
+};
+
+async function pollOnce(c: Config, source: Source, lastSeen: LastSeen, dryRun: boolean): Promise<PollResult> {
   const next: LastSeen = { ...lastSeen };
+  let queued = 0;
   let failedChannels = 0;
   const failedIds = new Set<string>();
-  let authError: unknown | null = null;
-  let credentialError: unknown | null = null;
-  for (const ch of CHANNELS) {
+  let authError: unknown = null;
+  let credentialError: unknown = null;
+  for (const ch of c.channels) {
     try {
       const after = lastSeen[ch.id];
-      const path = after
-        ? `/channels/${ch.id}/messages?limit=25&after=${after}`
-        : `/channels/${ch.id}/messages?limit=10`;
-      const msgs = (await {{FETCH_CALL}}) as any[];
-      // A non-array body (e.g. an error object) is a failure for this
-      // channel, not an empty success. An empty array is a quiet success.
-      if (!Array.isArray(msgs)) {
-        throw Object.assign(new Error("unexpected non-array response"), { status: (msgs as any)?.status });
+      const items = await source.fetch(ch, after);
+      // A non-array body is a failure for this channel, not an empty success.
+      if (!Array.isArray(items)) {
+        throw new SourceError("unexpected non-array response");
       }
-      if (msgs.length === 0) continue;
-      // Source returns newest-first; process oldest-first so the queue stays in order.
-      const ordered = [...msgs].reverse();
-      const newest = ordered[ordered.length - 1].id;
-      if (!after && !dryRun) {
-        // First sight of this channel: baseline only, queue nothing (no stale replies).
-        next[ch.id] = newest;
-        log(`baseline #${ch.name} at ${newest} (${ordered.length} messages seen, queued none)`);
+      if (items.length === 0) {
+        if (after === undefined) log("info", "baseline_empty", { channel: ch.name });
         continue;
       }
-      for (const m of ordered) {
-        if (m.author?.id === BOT_ID) continue; // never answer our own lines
-        {{IS_NEW}}
-        const task = {{QUEUE_ITEM}};
-        if (dryRun) {
-          log(`WOULD QUEUE #${ch.name} ${m.id}`);
-        } else {
-          mkdirSync(STATE_DIR, { recursive: true });
-          appendFileSync(QUEUE_FILE, JSON.stringify(task) + "\n");
-          log(`queued #${ch.name} ${m.id}`);
-        }
-        // Advance the cursor per message, AFTER its append succeeds — so
-        // a mid-loop throw does not lose the messages that were already
-        // queued (the old code advanced to `newest` before the loop).
-        next[ch.id] = m.id;
+      const newest = source.cursorOf(items[0]);
+      if (after === undefined) {
+        // First sight of this channel: baseline only, queue nothing.
+        if (!dryRun) next[ch.id] = newest;
+        log("info", "baseline", { channel: ch.name, cursor: newest, seen: items.length, queued: 0 });
+        continue;
       }
-      // The loop completed: advance past any trailing filtered messages
-      // (the bot's own lines, or messages {{IS_NEW}} skipped), so they
-      // are not re-fetched on every poll. A mid-loop throw leaves the
-      // cursor at the last successfully queued message instead.
-      next[ch.id] = newest;
-    } catch (e: any) {
-      // Per-channel errors are caught here so one bad channel does not
-      // stall the others — but they are COUNTED, not swallowed. The caller
-      // treats an all-channels-failed cycle as a cycle failure.
+      // Source returns newest-first; queue oldest-first.
+      const fresh = items.filter((i) => source.isNew(i, after)).reverse();
+      if (fresh.length > 0) {
+        if (dryRun) {
+          log("info", "would_queue", { channel: ch.name, count: fresh.length });
+        } else {
+          appendQueue(c, fresh.map((i) => JSON.stringify(source.toQueueItem(ch, i))));
+          queued += fresh.length;
+          log("info", "queued", { channel: ch.name, count: fresh.length, cursor: newest });
+        }
+      }
+      // Advance only after the batch append succeeded (a throw above leaves
+      // the cursor where it was); also moves past trailing filtered items.
+      if (!dryRun) next[ch.id] = newest;
+    } catch (e) {
+      // Counted, not swallowed: the caller treats an all-channels-failed
+      // cycle as a cycle failure.
       failedChannels++;
       failedIds.add(ch.id);
       if (isAuthError(e)) authError = e;
       if (isCredentialError(e)) credentialError = e;
-      log(`#${ch.name} poll failed: ${e.message}`);
+      log("warn", "channel_failed", { channel: ch.name, error: errMsg(e).slice(0, 500), status: errStatus(e) });
     }
   }
-  return { next, failedChannels, failedIds, authError, credentialError };
+  return { next, queued, failedChannels, failedIds, authError, credentialError };
 }
 
-async function main() {
-  const dryRun = {{DRY_RUN_FLAG}};
-  mkdirSync(STATE_DIR, { recursive: true });
-  if (dryRun) {
-    log("dry-run: one cycle, writing nothing");
-    await pollOnce(loadLastSeen(), true);
-    log("dry-run done");
-    return;
+export type RunOptions = {
+  maxPolls?: number;
+  dryRun?: boolean;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  random?: () => number;
+};
+
+/** The daemon loop. Resolves with the process exit code (0 = clean stop or
+ *  max polls reached, 1 = gave up or auth error). Throws LockError if
+ *  another instance holds the pidfile. */
+export async function run(c: Config, source: Source, opts: RunOptions = {}): Promise<number> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const random = opts.random ?? Math.random;
+  mkdirSync(stateDir(c), { recursive: true });
+  if (opts.dryRun) {
+    log("info", "dry_run", { detail: "one cycle, writing nothing" });
+    await pollOnce(c, source, loadLastSeen(c), true);
+    log("info", "dry_run_done");
+    return 0;
   }
-  takeDaemonLock();
-  // A fresh start clears any error marker from a previous run.
-  if (existsSync(ERROR_FILE)) unlinkSync(ERROR_FILE);
-  log("{{DAEMON_NAME}} live — {{SOURCE_DESCRIPTION}}, polling every " +
-    `${POLL_MS / 1000}s ±${POLL_JITTER_MS / 1000}s jitter (stop file: {{STOP_FILE_NAME}})`);
-  let lastSeen = loadLastSeen();
-  let consecutiveFailures = 0;
-  const channelFailures: Record<string, number> = {};
-  while (true) {
-    if (existsSync(STOP_FILE)) {
-      log("stop file present — exiting");
-      return;
-    }
-    const cycleStart = Date.now();
-    try {
-      const { next, failedChannels, failedIds, authError, credentialError } = await pollOnce(lastSeen, false);
-      // Exit at once only for a credential-wide failure (a 401 on any
-      // channel) or when an auth error hit every channel in the cycle. An
-      // auth-class error (e.g. a documented 403) on just some channels
-      // usually means missing access to those channels, so the others keep
-      // being served and the per-channel counter below reports it.
-      if (credentialError || (authError && failedChannels === CHANNELS.length)) {
-        // A permanent failure (expired/revoked credential) will never
-        // succeed by retrying. Mark it and exit non-zero so the worker's
-        // liveness check notices instead of the daemon sitting in `ps`
-        // looking alive while nothing is ever queued.
-        writeError("auth", credentialError ?? authError);
-        log("auth error — exiting (check the credential)");
-        process.exit(1);
+  const release = takeDaemonLock(c);
+  try {
+    const errorFile = join(stateDir(c), "error.json");
+    const warnFile = join(stateDir(c), "channel-warning.json"); // a channel keeps failing; daemon still running
+    if (existsSync(errorFile)) unlinkSync(errorFile); // a fresh start clears the old marker
+    log("info", "start", { name: c.name, poll_secs: c.pollSecs, jitter_secs: c.pollJitterSecs,
+      stop_file: c.stopFileName, channels: c.channels.map((ch) => ch.name) });
+    let lastSeen = loadLastSeen(c);
+    let failures = 0;
+    let polls = 0;
+    const channelFailures: Record<string, number> = {};
+    while (true) {
+      if (existsSync(stopFile(c))) {
+        log("info", "stop", { detail: "stop file present" });
+        return 0;
       }
-      // Per-channel consecutive failures: a channel that keeps failing
-      // while others succeed is flagged (channel-warning.json) but does not stop
-      // the daemon.
-      for (const ch of CHANNELS) {
-        channelFailures[ch.id] = failedIds.has(ch.id) ? (channelFailures[ch.id] ?? 0) + 1 : 0;
-        if (channelFailures[ch.id] === MAX_FAILURES && failedChannels < CHANNELS.length) {
-          log(`#${ch.name} failed ${MAX_FAILURES} cycles in a row — channel-warning.json written, daemon keeps running`);
+      const start = now();
+      let backoffSecs: number | null = null;
+      const stepFor = (n: number) => c.backoffStepsSecs[Math.min(n - 1, c.backoffStepsSecs.length - 1)];
+      try {
+        const res = await pollOnce(c, source, lastSeen, false);
+        // Exit at once only for a credential-wide failure (a 401 on any
+        // channel) or when an auth error hit every channel in the cycle.
+        if (res.credentialError || (res.authError && res.failedChannels === c.channels.length)) {
+          writeError(c, "auth", res.credentialError ?? res.authError);
+          log("error", "auth_error", { detail: "exiting - check the credential" });
+          return 1;
+        }
+        // Per-channel consecutive failures: a channel that keeps failing
+        // while others succeed is flagged but does not stop the daemon.
+        for (const ch of c.channels) {
+          channelFailures[ch.id] = res.failedIds.has(ch.id) ? (channelFailures[ch.id] ?? 0) + 1 : 0;
+          if (channelFailures[ch.id] === c.maxFailures && res.failedChannels < c.channels.length) {
+            log("warn", "channel_warning", { channel: ch.name, failures: c.maxFailures,
+              detail: "channel-warning.json written, daemon keeps running" });
+          }
+        }
+        const failing = c.channels.filter((ch) => (channelFailures[ch.id] ?? 0) >= c.maxFailures).map((ch) => ch.name);
+        if (failing.length > 0 && res.failedChannels < c.channels.length) {
+          atomicWriteJson(warnFile, { kind: "channel_failing", channels: failing, at: new Date().toISOString() });
+        } else if (failing.length === 0 && existsSync(warnFile)) {
+          try { unlinkSync(warnFile); } catch { /* already gone */ }
+          log("info", "channel_recovered", { detail: "channel-warning.json removed" });
+        }
+        if (res.failedChannels === c.channels.length) {
+          // Every channel failed: the daemon is effectively dead, so this
+          // counts as a cycle failure. No heartbeat.
+          failures++;
+          backoffSecs = stepFor(failures);
+          log("warn", "poll_failed", { attempt: failures, max_failures: c.maxFailures, backoff_secs: backoffSecs,
+            error: `all ${c.channels.length} channel(s) failed` });
+          if (failures >= c.maxFailures) {
+            writeError(c, "consecutive_failures", "all channels failed");
+            log("error", "give_up", { failures });
+            return 1;
+          }
+        } else {
+          lastSeen = res.next;
+          // Heartbeat on every successful cycle, even a quiet one.
+          saveLastSeen(c, lastSeen);
+          failures = 0;
+          log("info", "poll_ok", { queued: res.queued, failed_channels: res.failedChannels,
+            duration_ms: now() - start });
+        }
+      } catch (e) {
+        failures++;
+        backoffSecs = stepFor(failures);
+        log("warn", "poll_failed", { attempt: failures, max_failures: c.maxFailures, backoff_secs: backoffSecs,
+          error: errMsg(e).slice(0, 500), status: errStatus(e) });
+        if (isAuthError(e)) {
+          writeError(c, "auth", e);
+          log("error", "auth_error", { detail: "exiting - check the credential" });
+          return 1;
+        }
+        if (failures >= c.maxFailures) {
+          writeError(c, "consecutive_failures", e);
+          log("error", "give_up", { failures });
+          return 1;
         }
       }
-      const failing = CHANNELS.filter((ch) => (channelFailures[ch.id] ?? 0) >= MAX_FAILURES).map((ch) => ch.name);
-      if (failing.length > 0 && failedChannels < CHANNELS.length) {
-        atomicWriteJson(WARN_FILE, { kind: "channel_failing", channels: failing, at: new Date().toISOString() });
-      } else if (failing.length === 0 && existsSync(WARN_FILE)) {
-        try { unlinkSync(WARN_FILE); } catch {} // the failing channel(s) recovered
+      const cycleMs = now() - start;
+      if (cycleMs > c.slowCallSecs * 1000) {
+        log("warn", "poll_slow", { duration_ms: cycleMs, threshold_secs: c.slowCallSecs });
       }
-      if (failedChannels === CHANNELS.length) {
-        // Every channel failed (e.g. a 401 on every read): the daemon is
-        // effectively dead, so this counts as a cycle failure. Do NOT
-        // saveLastSeen here — that would keep polled_at fresh while the
-        // daemon is down.
-        consecutiveFailures++;
-        log(`all ${CHANNELS.length} channel(s) failed (${consecutiveFailures} in a row)`);
-        if (consecutiveFailures >= MAX_FAILURES) {
-          writeError("consecutive_failures", "all channels failed");
-          log(`${MAX_FAILURES} consecutive failed cycles — exiting`);
-          process.exit(1);
-        }
-      } else {
-        lastSeen = next;
-        // Heartbeat on every successful cycle, even a quiet one.
-        saveLastSeen(lastSeen);
-        consecutiveFailures = 0;
-      }
-    } catch (e: any) {
-      consecutiveFailures++;
-      log(`cycle error (${consecutiveFailures} in a row): ${e.message}`);
-      if (isAuthError(e)) {
-        writeError("auth", e);
-        log("auth error — exiting (check the credential)");
-        process.exit(1);
-      }
-      if (consecutiveFailures >= MAX_FAILURES) {
-        writeError("consecutive_failures", e);
-        log(`${MAX_FAILURES} consecutive failures — exiting`);
-        process.exit(1);
-      }
+      polls++;
+      if (opts.maxPolls !== undefined && polls >= opts.maxPolls) return 0;
+      // Jittered sleep, stretched by backoff after failures. The first
+      // failure sleeps backoff_steps[0] (not the last step).
+      let sleepMs = (backoffSecs === null ? c.pollSecs : Math.max(c.pollSecs, backoffSecs)) * 1000;
+      sleepMs += (random() * 2 - 1) * c.pollJitterSecs * 1000;
+      await sleep(Math.max(1000, sleepMs));
     }
-    const cycleMs = Date.now() - cycleStart;
-    if (cycleMs > {{SLOW_CYCLE_MS}}) log(`slow cycle: ${cycleMs}ms (retries likely — watch rate limits)`);
-    // Jittered sleep, stretched by backoff after consecutive failures.
-    // Backoff applies only after a failure, and the first failure sleeps
-    // BACKOFF_STEPS[0] (not the last step).
-    let sleepMs: number;
-    if (consecutiveFailures > 0) {
-      const step = BACKOFF_STEPS[Math.min(consecutiveFailures - 1, BACKOFF_STEPS.length - 1)];
-      sleepMs = Math.max(POLL_MS, step);
-    } else {
-      sleepMs = POLL_MS;
-    }
-    sleepMs += (Math.random() * 2 - 1) * POLL_JITTER_MS;
-    await sleep(Math.max(1000, sleepMs));
+  } finally {
+    release();
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  let path = process.env.POLLER_CONFIG;
+  const i = argv.indexOf("--config");
+  if (i >= 0) path = argv[i + 1];
+  let config: Config;
+  let source: Source;
+  try {
+    if (!path) throw new ConfigError("config: pass --config PATH or set POLLER_CONFIG");
+    config = loadConfig(path);
+    source = await loadSource(config);
+  } catch (e) {
+    log("error", "config_error", { detail: errMsg(e) });
+    return 2;
+  }
+  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+  try {
+    return await run(config, source, { dryRun: argv.includes("--dry-run") });
+  } catch (e) {
+    log("error", e instanceof LockError ? "already_running" : "fatal", { detail: errMsg(e) });
+    return 1;
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exit(await main());
+}

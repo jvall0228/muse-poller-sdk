@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.1.0 — 2026-11-13
+
+The daemons become tested modules, the worker lock and queue rotation become scripts, and the repo gains tests, a leak check and CI.
+
+### Breaking (pollers built from 1.0.x)
+
+- **A config file replaces the daemon placeholders.** `daemon.py` and `daemon.ts` no longer contain `{{...}}` placeholders. Timing, channels, backoff, `max_failures`, state names and the adapter are keys in a JSON config passed with `--config` or `POLLER_CONFIG`. Invalid config exits 2.
+- **TS timing config is in seconds, not milliseconds.** All times in both configs are seconds.
+- **`QUEUE_NAME` is removed from the TS daemon.** The queue is always `queue.jsonl`.
+- **`last-seen.json` has one shape.** The Python daemon writes `{"channels": {"<id>": "<cursor>"}, "polled_at": ...}`, like the TS daemon. The old `{"ts", "polled_at"}` still loads. A channel's cursor moves only after that channel's whole batch is appended.
+- **`{{SCRIPTS_DIR}}` in the briefs.** Worker, router and slice-worker briefs call `lock-holder.sh` and `rotate-queue.sh` through this new placeholder; copy the scripts next to the briefs.
+- **Producers append under `flock -x queue.lock`.** Any custom producer (router, handoffs, other writers) must take the lock around every append, or a rotation can drop its line.
+- **Logs are JSON lines on stderr** (`{"ts","level","event",...}`). Anything that matched the old prose log lines must match `event` names.
+
+### Added
+
+- **Source adapter interface** (`fetch`, `is_new`/`isNew`, `cursor_of`/`cursorOf`, `to_queue_item`/`toQueueItem`, `SourceError(msg, status)`; auth is status 401) with example HTTP adapters, example configs and a strict `tsconfig.json` for the TS daemon.
+- **`templates/lock-holder.sh`** (`take`, `release`, `status`) replacing the inline lock one-liner in the worker brief.
+- **`templates/rotate-queue.sh`**: archives a fully consumed queue under `queue.lock`, resets the cursor to 0, keeps the newest N archives.
+- **Hook:** reads the line count and cursor under a non-blocking shared `flock` on `queue.lock` (silent "queue busy" if held) and treats `cursor > lines` or a non-numeric cursor as 0.
+- **Tests:** `tests/daemon` (pytest and `bun test`) and `tests/hook/run.sh` (plain bash, stub runtime).
+- **`scripts/check-leaks.sh`** and **`.github/workflows/ci.yml`** (shellcheck, ruff, pytest, tsc strict, bun test, hook tests, leak check), plus a `.gitignore`.
+- **Requirements:** `flock(1)` is now also needed by the TS daemon (it spawns it for appends) and by rotation; Python 3.10+ or bun.
+
+### Changed
+
+- **Docs single-sourced.** Mechanisms live in `docs/design.md`, the build contract in the SDK `SKILL.md`, operating in the usage `SKILL.md`, requirements and test commands in the `README.md`; other files link instead of restating. New ADR-12 (adapter and config), ADR-13 (lock script, queue lock, rotation) and ADR-14 (JSON logs); ADR-8 and ADR-10 amended.
+- The review guide's template-fidelity check now covers the daemons as modules (loop logic, not filled-in values).
+
 ## 1.0.2
 
 Review follow-up. Template-only changes: pollers built from earlier versions need the same edits to benefit.

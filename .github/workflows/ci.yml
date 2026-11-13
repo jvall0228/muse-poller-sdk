@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x local-subagent-poller/templates/*.sh tests/hook/*.sh scripts/*.sh
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest==9.2.0 ruff==0.17.5
+      - name: ruff
+        run: ruff check .
+      - name: pytest
+        run: python -m pytest tests/daemon
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - run: bun install
+      - name: tsc (strict)
+        run: bunx tsc --noEmit -p local-subagent-poller/templates/tsconfig.json
+      - name: bun test
+        run: bun test tests/daemon
+
+  hook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: hook, lock holder and rotation tests
+        run: tests/hook/run.sh
+
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check-leaks
+        run: scripts/check-leaks.sh

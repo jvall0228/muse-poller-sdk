@@ -50,13 +50,16 @@ A second review of the public repo landed as 25 line comments on draft PR 1 (the
 - **Genericization (comments on `instances.md`, the skills, `hook-prompt.md`, `worker-brief.md`, `review-guide.md`, `README.md`).** The public copy identified a third party by chat handle, published one deployment's standing-permission terms, and carried project/bot names, internal ticket IDs, and private workspace paths as examples. Fixed (public copy only — the local copies keep the real values): the handle is now "a test mention from a server member"; the standing-permission terms are now "acts within the owner's configured scope"; project/bot names, ticket IDs, and private paths are generic placeholders. The review guide's opening line now addresses "anyone reviewing this SDK before adopting it". The README gained a Requirements section naming the hook runtime (`$HATCH_HOOK_RUNTIME` with `hook_state_get`/`hook_state_set`/`silent`/`wake`, `hooks.add`/`dry_run`/`run`), plus bash, `jq`, and bun for the TS daemon — and what a user on another runtime must supply.
 - **Frontmatter (comments on both skills).** Both skills had no YAML frontmatter. Added: `name` + a one-paragraph `description` for each.
 
-## Template checks (after the fixes)
+## Automated checks (1.1.0)
 
-- **Filled `daemon.py` compiles** (`python3 -m py_compile`) with sample values, and its empty-first-poll, baseline, queueing, heartbeat, auth-exit, and single-instance paths were exercised live (see the second review above).
-- **Filled `hook-watch.sh` passes `bash -n`**, and its four states were exercised against a stubbed hook runtime (see B2 above and the second review above).
-- **Filled `daemon.ts` builds** (`bun build --target=bun`) with a stub fetch module, and its empty-first-poll, baseline, queueing, heartbeat, auth-exit, pidfile-lock, and dry-run paths were exercised live.
-- **The worker lock holder was exercised** (held while the alive file is fresh, second take fails at once, self-releases on staleness).
-- **Both skill copies are identical** (`diff -r` clean between the two local copies), and the public copy was verified free of deployment-specific references (no project/bot names, ticket IDs, private paths, or identifiers — grep clean).
+Since 1.1.0 the daemons are modules and the hook-side logic has scripts, so verification is repeatable rather than a one-off run of filled templates. The commands are in the `README.md` ("Running the checks") and run in CI:
+
+- `tests/daemon` (pytest and `bun test`): the empty-first-poll baseline, per-channel cursors and batch-complete cursor moves, heartbeat, auth exit, `max_failures`, single-instance lock, config validation, and queue appends under `queue.lock`.
+- `tests/hook/run.sh`: every hook state against a stub runtime (including queue busy and rotated), `lock-holder.sh` (held while the alive file is fresh, a second take fails, self-release on staleness, release), and `rotate-queue.sh` (rotates only when caught up, archive naming and retention, cursor reset).
+- `shellcheck -x` on the templates, tests and scripts; `ruff check`; `tsc --noEmit` in strict mode on the TS daemon and its tests.
+- `scripts/check-leaks.sh`: no home paths, emails, chat-style IDs or ticket keys in tracked files, plus any terms in a local `.leak-terms` file.
+
+Earlier manual checks (1.0.x, before the daemons became modules) are recorded in the sections above: filled templates compiled, and the baseline, queueing, heartbeat, auth-exit and single-instance paths were exercised live.
 
 ## Live tests
 
