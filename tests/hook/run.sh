@@ -182,7 +182,7 @@ mkreg() { # mkreg PGREP HEARTBEAT_FILE STALE STOP_FILE ("" = null / none)
       '{daemons: [{id: "fake", pgrep: $pg, heartbeat_file: (if $hb == "" then null else $hb end), heartbeat_field: "polled_at", stale_secs: $st, stop_file: $sf, start: "setsid nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
 }
 start_fake() { # start_fake SECS -> FAKE_PAT / FAKE_PID (a real process to pgrep)
-    sleep "$1" & FAKE_PID=$!; BG_PIDS+=($FAKE_PID); FAKE_PAT="^sleep $1\$"
+    sleep "$1" & FAKE_PID=$!; BG_PIDS+=("$FAKE_PID"); FAKE_PAT="^sleep $1\$"
 }
 stop_fake() { kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null || true; }
 

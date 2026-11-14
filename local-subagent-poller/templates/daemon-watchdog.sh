@@ -75,10 +75,11 @@
 #   6. daemon down but woken inside the cooldown -> silent "restart already in progress (cooldown)"
 #   7. daemon process alive but heartbeat stale -> WAKE, payload reason "heartbeat stale"
 set -euo pipefail
+# shellcheck source=/dev/null
 source "$HATCH_HOOK_RUNTIME"
 
 REGISTRY="{{REGISTRY_PATH}}"
-WAKE_COOLDOWN_SECS={{WAKE_COOLDOWN_SECS}}
+WAKE_COOLDOWN_SECS="{{WAKE_COOLDOWN_SECS}}"
 
 if ! command -v jq >/dev/null 2>&1; then
     silent "jq not installed; cannot read the daemon registry" '{}'
