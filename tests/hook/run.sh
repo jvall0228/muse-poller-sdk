@@ -314,6 +314,176 @@ run_hook
 eq "wd bad id: silent" "$(kind)" silent
 has "wd bad id: reason names it" "$(reason)" "bad daemon id"
 
+# ---- watchdog hardening ----------------------------------------------------
+iso_in() { date -u -d "@$(( $(date +%s) + $1 ))" +%Y-%m-%dT%H:%M:%SZ; }
+
+# bad / blank / non-numeric cooldown -> explicit silent reason, not false-quiet
+for bad in '10m' '' '-5'; do
+    new_wd_case "wd_badcool_$RANDOM"
+    sed -i "s|^WAKE_COOLDOWN_SECS=.*|WAKE_COOLDOWN_SECS=\"$bad\"|" "$HOOK"
+    mkreg "^sleep 399$" "" 0 ""
+    run_hook
+    eq "wd cooldown '$bad': silent" "$(kind)" silent
+    has "wd cooldown '$bad': reason" "$(reason)" "WAKE_COOLDOWN_SECS"
+done
+new_wd_case wd_badcool_ph
+sed -i 's|^WAKE_COOLDOWN_SECS=.*|WAKE_COOLDOWN_SECS="{{WAKE_COOLDOWN_SECS}}"|' "$HOOK"
+mkreg "^sleep 399$" "" 0 ""
+run_hook
+has "wd unfilled cooldown placeholder: reason" "$(reason)" "placeholder not filled"
+
+# registry path still a placeholder -> explicit reason
+new_wd_case wd_regph
+sed -i '0,/^REGISTRY=/s|^REGISTRY=.*|REGISTRY="{{REGISTRY_PATH}}"|' "$HOOK"
+run_hook
+eq "wd unfilled registry placeholder: silent" "$(kind)" silent
+has "wd unfilled registry placeholder: reason" "$(reason)" "placeholder not filled"
+
+# registry path with a leading ~ is expanded against $HOME
+new_wd_case wd_tilde
+mkdir -p "$D/home"
+sed -i '0,/^REGISTRY=/s|^REGISTRY=.*|REGISTRY="~/registry.json"|' "$HOOK"
+mkreg "^sleep 399$" "" 0 ""; mv "$D/registry.json" "$D/home/registry.json"
+run_hook "HOME=$D/home"
+eq "wd tilde registry: found and processed (wake, daemon down)" "$(kind)" wake
+
+# negative age (polled_at one second in the future) with a live process: healthy
+new_wd_case wd_future
+start_fake 303
+printf '{"polled_at":"%s"}' "$(iso_in 1)" > "$D/last-seen.json"
+mkreg "$FAKE_PAT" "$D/last-seen.json" 30 ""
+run_hook
+eq "wd future polled_at: silent" "$(kind)" silent
+has "wd future polled_at: healthy" "$(reason)" "all daemons healthy"
+
+# epoch-integer polled_at is accepted
+printf '{"polled_at":%s}' "$(date +%s)" > "$D/last-seen.json"
+run_hook
+eq "wd epoch polled_at fresh: silent healthy" "$(kind)" silent
+has "wd epoch polled_at fresh: reason" "$(reason)" "all daemons healthy"
+printf '{"polled_at":1600000000}' > "$D/last-seen.json"
+run_hook
+eq "wd epoch polled_at old: wake" "$(kind)" wake
+has "wd epoch polled_at old: stale" "$(payload | jq -r .down.fake)" "heartbeat stale"
+
+# unparseable polled_at is not "healthy": named, skipped, no false-healthy
+printf '{"polled_at":"garbage"}' > "$D/last-seen.json"
+run_hook
+eq "wd unparseable polled_at: silent" "$(kind)" silent
+has "wd unparseable polled_at: reason names it" "$(reason)" "unparseable polled_at for fake"
+lacks "wd unparseable polled_at: not 'all daemons healthy'" "$(reason)" "all daemons healthy"
+has "wd unparseable polled_at: nothing supervised" "$(reason)" "no daemons supervised"
+stop_fake
+
+# missing heartbeat file with live process is still down, reason exact
+new_wd_case wd_nohb
+start_fake 304
+mkreg "$FAKE_PAT" "$D/missing.json" 30 ""
+run_hook
+eq "wd missing heartbeat file: wake" "$(kind)" wake
+eq "wd missing heartbeat file: reason" "$(payload | jq -r .down.fake)" "process alive but no heartbeat file"
+stop_fake
+
+# every entry rejected -> says nothing was supervised, not "healthy"
+new_wd_case wd_allbad
+mkreg "sleep 399" "" 0 ""
+run_hook
+has "wd all rejected: reason leads with no daemons supervised" "$(reason)" "no daemons supervised"
+lacks "wd all rejected: never says healthy" "$(reason)" "healthy"
+
+# some checked, some skipped -> counts and names both
+new_wd_case wd_somebad
+start_fake 305
+jq -n --arg pg "$FAKE_PAT" '{daemons: [
+  {id: "good", pgrep: $pg, heartbeat_file: null, stale_secs: 0, start: "x", verify: "x"},
+  {id: "bad", pgrep: "unanchored", heartbeat_file: null, stale_secs: 0, start: "x", verify: "x"}]}' > "$D/registry.json"
+run_hook
+eq "wd partial: silent" "$(kind)" silent
+has "wd partial: counts healthy" "$(reason)" "1 healthy, others skipped"
+has "wd partial: names skipped" "$(reason)" "unanchored pgrep pattern for bad"
+stop_fake
+
+# non-object .waking / .wakes in hook state is normalised, not fatal
+new_wd_case wd_badwaking
+mkreg "^sleep 399$" "" 0 ""
+echo '{"waking":5,"wakes":"x"}' > "$D/state.json"
+run_hook
+eq "wd non-object .waking: wake" "$(kind)" wake
+check "wd non-object .waking: state repaired" test "$(state '.waking.fake')" -ge "$NOW"
+echo '{"waking":{"fake":"soon"}}' > "$D/state.json"
+run_hook
+eq "wd non-numeric waking value: wake" "$(kind)" wake
+
+# non-object registry entry: correct reason, not "duplicate daemon ids"
+new_wd_case wd_nonobj
+echo '{"daemons":["oops",{"id":"a","pgrep":"^sleep 399$"}]}' > "$D/registry.json"
+run_hook
+eq "wd non-object entry: silent" "$(kind)" silent
+has "wd non-object entry: reason" "$(reason)" "non-object entry"
+
+# two entries both lacking pgrep: per-entry note, not "duplicate pgrep"
+new_wd_case wd_nopgrep2
+echo '{"daemons":[{"id":"a"},{"id":"b"}]}' > "$D/registry.json"
+run_hook
+eq "wd two missing pgrep: silent" "$(kind)" silent
+has "wd two missing pgrep: per-entry reason" "$(reason)" "missing pgrep pattern for a"
+lacks "wd two missing pgrep: not duplicate" "$(reason)" "duplicate"
+
+# consecutive-wake backoff: wake, wake, wake, then silent "gave up"
+new_wd_case wd_backoff
+mkreg "^sleep 399$" "" 0 ""
+for n in 1 2 3; do
+    echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":$((n - 1))}}" > "$D/state.json"
+    run_hook
+    eq "wd backoff: wake $n of 3" "$(kind)" wake
+    eq "wd backoff: count after wake $n" "$(state .wakes.fake)" "$n"
+done
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":3}}" > "$D/state.json"
+run_hook
+eq "wd backoff: 4th is silent" "$(kind)" silent
+has "wd backoff: reason says gave up" "$(reason)" "gave up waking for fake"
+# within cooldown after the last allowed wake: plain cooldown, not gave up
+echo "{\"waking\":{\"fake\":$NOW},\"wakes\":{\"fake\":3}}" > "$D/state.json"
+run_hook
+has "wd backoff: in cooldown reads as cooldown" "$(reason)" "already in progress"
+# the limit is overridable
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":3}}" > "$D/state.json"
+run_hook WATCHDOG_MAX_CONSECUTIVE_WAKES=5
+eq "wd backoff: override raises limit" "$(kind)" wake
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":1}}" > "$D/state.json"
+run_hook WATCHDOG_MAX_CONSECUTIVE_WAKES=1
+eq "wd backoff: override lowers limit" "$(kind)" silent
+# healthy daemon resets its count
+new_wd_case wd_backoff_reset
+start_fake 306
+mkreg "$FAKE_PAT" "" 0 ""
+echo '{"wakes":{"fake":3,"other":2}}' > "$D/state.json"
+run_hook
+eq "wd backoff reset: healthy silent" "$(kind)" silent
+eq "wd backoff reset: count cleared" "$(state '.wakes.fake // "none"')" none
+eq "wd backoff reset: other ids untouched" "$(state .wakes.other)" 2
+stop_fake
+
+# alternation: an unparenthesised | leaves one branch unanchored
+new_wd_case wd_alt
+mkreg '^nope|sleep 777$' "" 0 ""
+run_hook
+eq "wd alternation: silent" "$(kind)" silent
+has "wd alternation: rejected as unanchored" "$(reason)" "unanchored pgrep pattern for fake"
+mkreg '^(nope|sleep 777)$' "" 0 ""
+run_hook
+eq "wd grouped alternation: accepted (daemon down -> wake)" "$(kind)" wake
+mkreg '^sleep 777\$' "" 0 ""
+run_hook
+has "wd escaped final dollar: rejected" "$(reason)" "unanchored pgrep pattern for fake"
+
+# the worker brief branches on the exact reasons the script emits
+BRIEF="$TPL/watchdog-worker-brief.md"
+for r in "process missing" "heartbeat stale" "process alive but no heartbeat file"; do
+    check "brief names reason '$r'" grep -qF "$r" "$BRIEF"
+done
+check "brief covers error.json" grep -q "error.json" "$BRIEF"
+
 echo "== lock-holder.sh =="
 LH="$TPL/lock-holder.sh"
 L="$T/lh"; mkdir -p "$L"

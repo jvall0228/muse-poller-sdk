@@ -8,7 +8,7 @@ One watchdog supervises all daemons, and transparency is a decision at the resol
 
 - **Daemon supervision templates** (`daemon-watchdog.sh`, `watchdog-worker-brief.md`, `daemon-registry.example.json`): one hook (60s poll) reads a registry of daemons and wakes a worker only when a daemon is down — process alive (anchored `pgrep`) and heartbeat fresh (`polled_at`). It never restarts an intentionally stopped daemon, and wakes only once per cooldown per daemon; the worker re-checks the stop file and `pgrep` before starting so a restart that already happened is not duplicated. The watchdog replaces the recovery cron (ADR-15).
 - **Transparency: the resolve gate.** Both worker briefs gain `{{RESOLVE_MODE}}` (`always` / `on-unexpected`, default) and a "Reporting (resolve)" section: the exit report ends in a verdict line (ACTED / UNEXPECTED / FAILED / ROUTINE). The hook prompt's load-bearing requirements are now six: the worker brief carries a RESOLVE instruction, and the spawner confirms it is there and resolves the verdict line. One persistent side chat per poller relays handoffs visibly (ADR-16).
-- **Hook tests for the watchdog.** `tests/hook/run.sh` exercises the watchdog's seven dry-run states against the stub runtime.
+- **Hook tests for the watchdog.** `tests/hook/run.sh` exercises the watchdog's eight dry-run states and its config-error, clock-skew, backoff and brief-reason edge cases against the stub runtime.
 
 ### Changed
 
