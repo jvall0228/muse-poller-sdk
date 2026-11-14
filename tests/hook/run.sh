@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — plain-bash tests for the poller hook, lock holder and queue rotation.
+# run.sh — plain-bash tests for the poller hook, daemon watchdog, lock holder and queue rotation.
 # Usage: tests/hook/run.sh        (needs bash, jq, flock; ~30s)
 set -uo pipefail
 
@@ -163,6 +163,156 @@ eq "queue.lock busy: state untouched" "$(cat "$D/state.json")" '{"baselined":tru
 unhold
 run_hook
 eq "queue.lock free again: wake" "$(kind)" wake
+
+echo "== daemon-watchdog.sh =="
+
+# fill_wd SRC DST DIR — fill the watchdog template's two placeholders
+fill_wd() { sed -e "s|{{REGISTRY_PATH}}|$3/registry.json|g" \
+        -e "s|{{WAKE_COOLDOWN_SECS}}|600|g" "$1" > "$2"; }
+# new_wd_case NAME -> sets D (state dir) and HOOK (filled watchdog script).
+# The registry is written by mkreg, not here: case 1 has no registry at all.
+new_wd_case() {
+    D="$T/$1"; mkdir -p "$D"
+    HOOK="$D/wd.sh"
+    fill_wd "$TPL/daemon-watchdog.sh" "$HOOK" "$D"
+    if grep -qE '\{\{[A-Z_]+\}\}' "$HOOK"; then nok "$1: unfilled placeholder in watchdog"; fi
+}
+mkreg() { # mkreg PGREP HEARTBEAT_FILE STALE STOP_FILE ("" = null / none)
+    jq -n --arg pg "$1" --arg hb "$2" --argjson st "$3" --arg sf "$4" \
+      '{daemons: [{id: "fake", pgrep: $pg, heartbeat_file: (if $hb == "" then null else $hb end), heartbeat_field: "polled_at", stale_secs: $st, stop_file: $sf, start: "setsid nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
+}
+start_fake() { # start_fake SECS -> FAKE_PAT / FAKE_PID (a real process to pgrep)
+    sleep "$1" & FAKE_PID=$!; BG_PIDS+=($FAKE_PID); FAKE_PAT="^sleep $1\$"
+}
+stop_fake() { kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null || true; }
+
+# 1. no registry file
+new_wd_case wd_noreg
+run_hook
+eq "wd no registry: silent" "$(kind)" silent
+has "wd no registry: reason" "$(reason)" "no daemon registry"
+
+# 2. registry with no daemons
+new_wd_case wd_empty
+echo '{"daemons": []}' > "$D/registry.json"
+run_hook
+eq "wd empty registry: silent" "$(kind)" silent
+has "wd empty registry: reason" "$(reason)" "no daemons registered"
+
+# 3. all daemons healthy (process-only)
+new_wd_case wd_healthy
+start_fake 301
+mkreg "$FAKE_PAT" "" 0 ""
+run_hook
+eq "wd healthy: silent" "$(kind)" silent
+has "wd healthy: reason" "$(reason)" "all daemons healthy"
+stop_fake
+
+# 4. one daemon stopped (dead process, stop file present -> still silent)
+new_wd_case wd_stopped
+mkreg "^sleep 399$" "" 0 "$D/fake-stop"
+touch "$D/fake-stop"
+run_hook
+eq "wd stopped: silent" "$(kind)" silent
+has "wd stopped: reason" "$(reason)" "intentionally stopped: fake"
+
+# 5. one daemon down -> wake, identifiers-only payload, cooldown recorded
+new_wd_case wd_down
+mkreg "^sleep 399$" "" 0 ""
+run_hook
+eq "wd down: wake" "$(kind)" wake
+eq "wd down: reason is process missing" "$(payload | jq -r .down.fake)" "process missing"
+check "wd down: cooldown recorded" test "$(state .waking.fake)" -ge "$NOW"
+lacks "wd down: no pgrep pattern in payload" "$(payload)" "sleep"
+
+# 6. daemon down but woken inside the cooldown -> silent
+printf '{"waking":{"fake":%s}}' "$NOW" > "$D/state.json"
+run_hook
+eq "wd cooldown: silent" "$(kind)" silent
+has "wd cooldown: reason" "$(reason)" "already in progress"
+
+# 7. heartbeat stale -> wake; fresh heartbeat -> silent
+new_wd_case wd_stale
+start_fake 302
+printf '{"polled_at":"2020-01-01T00:00:00Z"}' > "$D/last-seen.json"
+mkreg "$FAKE_PAT" "$D/last-seen.json" 30 ""
+run_hook
+eq "wd stale heartbeat: wake" "$(kind)" wake
+has "wd stale heartbeat: payload reason" "$(payload | jq -r .down.fake)" "heartbeat stale"
+printf '{"polled_at":"%s"}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$D/last-seen.json"
+run_hook
+eq "wd fresh heartbeat: silent" "$(kind)" silent
+has "wd fresh heartbeat: reason" "$(reason)" "all daemons healthy"
+stop_fake
+
+# extra: invalid pgrep pattern is a config error, not a down daemon
+# (anchored but an invalid regex, so it reaches the pgrep exit-2 path)
+new_wd_case wd_badpattern
+mkreg "^[invalid$" "" 0 ""
+run_hook
+eq "wd bad pattern: silent" "$(kind)" silent
+has "wd bad pattern: reason names it" "$(reason)" "invalid pgrep pattern for fake"
+
+# extra: unanchored pgrep pattern is a config error, not a down daemon
+new_wd_case wd_unanchored
+mkreg "sleep 399" "" 0 ""
+run_hook
+eq "wd unanchored pattern: silent" "$(kind)" silent
+has "wd unanchored pattern: reason names it" "$(reason)" "unanchored pgrep pattern for fake"
+
+# two daemons: one down and inside its cooldown, one down and due — the
+# wake payload names only the daemon this wake covers
+new_wd_case wd_two
+jq -n '{daemons: [
+  {id: "a", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "setsid nohup sleep 300 &", verify: "process alive"},
+  {id: "b", pgrep: "^sleep 399$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "setsid nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
+printf '{"waking":{"a":%s}}' "$NOW" > "$D/state.json"
+run_hook
+eq "wd two daemons: wake" "$(kind)" wake
+eq "wd two daemons: payload covers only b" "$(payload | jq -r '.down | keys | join(" ")')" "b"
+eq "wd two daemons: payload has one daemon" "$(payload | jq -r '.down | keys | length')" "1"
+
+# duplicate daemon ids are a config error, not a wake
+new_wd_case wd_dupid
+jq -n '{daemons: [
+  {id: "fake", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "x", verify: "x"},
+  {id: "fake", pgrep: "^sleep 399$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "x", verify: "x"}]}' > "$D/registry.json"
+run_hook
+eq "wd duplicate ids: silent" "$(kind)" silent
+has "wd duplicate ids: reason names it" "$(reason)" "duplicate daemon ids"
+
+# duplicate pgrep patterns are a config error (same daemon, two ids)
+new_wd_case wd_duppgrep
+jq -n '{daemons: [
+  {id: "a", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "x", verify: "x"},
+  {id: "b", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "x", verify: "x"}]}' > "$D/registry.json"
+run_hook
+eq "wd duplicate pgrep: silent" "$(kind)" silent
+has "wd duplicate pgrep: reason names it" "$(reason)" "duplicate pgrep patterns"
+
+# unreadable registry (not JSON) is a config error, not a wake
+new_wd_case wd_badjson
+echo 'not json' > "$D/registry.json"
+run_hook
+eq "wd unreadable registry: silent" "$(kind)" silent
+has "wd unreadable registry: reason names it" "$(reason)" "daemon registry unreadable"
+
+# a heartbeat file with a missing/zero stale_secs is a config error
+# (it would silently degrade to process-only)
+new_wd_case wd_badstale
+printf '{"polled_at":"2020-01-01T00:00:00Z"}' > "$D/last-seen.json"
+mkreg "^sleep 399$" "$D/last-seen.json" 0 ""
+run_hook
+eq "wd bad stale_secs: silent" "$(kind)" silent
+has "wd bad stale_secs: reason names it" "$(reason)" "bad stale_secs for fake"
+
+# a daemon id with a space is a config error (ids feed the
+# space-separated wake list)
+new_wd_case wd_badid
+jq -n '{daemons: [{id: "a b", pgrep: "^sleep 399$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "x", verify: "x"}]}' > "$D/registry.json"
+run_hook
+eq "wd bad id: silent" "$(kind)" silent
+has "wd bad id: reason names it" "$(reason)" "bad daemon id"
 
 echo "== lock-holder.sh =="
 LH="$TPL/lock-holder.sh"
