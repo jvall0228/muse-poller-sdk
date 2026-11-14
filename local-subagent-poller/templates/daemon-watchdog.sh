@@ -42,9 +42,10 @@
 #     an escaped `\$`: treated as unanchored (the `^`/`$` would bind only
 #     one alternative). Wrap alternations in a group: ^(a|b)$.
 #   - A polled_at that is present but unparsable (not ISO-8601 and not an
-#     epoch integer): that entry is skipped and named in the reason; it is
-#     NOT counted healthy. A negative age (heartbeat written a second
-#     after this poll read the clock) is clamped to 0.
+#     epoch integer), or a heartbeat file that is not valid JSON at all:
+#     that entry is skipped and named in the reason; it is NOT counted
+#     healthy. A negative age (heartbeat written a second after this poll
+#     read the clock) is clamped to 0.
 #   - Every entry skipped as a config error: the reason says "no daemons
 #     supervised — config errors: ..." rather than "all daemons healthy".
 #   - A daemon that never recovers (it wrote error.json on a 401 or
@@ -184,7 +185,13 @@ heartbeat_age() {
     local file="$1" field="${2:-polled_at}"
     [ -f "$file" ] || { echo absent; return; }
     local ts
-    ts=$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null || echo "")
+    # A jq parse failure (heartbeat file not valid JSON at all) must not
+    # collapse to "nofield": an unreadable heartbeat is unparseable, never
+    # healthy. (The if-condition suppresses set -e, so a failing jq is read
+    # here instead of killing the poll.)
+    if ! ts=$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null); then
+        echo unparseable; return
+    fi
     [ -n "$ts" ] || { echo nofield; return; }
     local t
     case "$ts" in
