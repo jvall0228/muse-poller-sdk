@@ -2,25 +2,25 @@
     "daemons": [
         {
             "heartbeat_field": "polled_at",
-            "heartbeat_file": "~/hooks/state/fleet-queue/last-seen.json",
-            "id": "fleet-queue",
-            "log_file": "~/hooks/logs/fleet-queue-watcher.log",
-            "pgrep": "^(.*[Pp]ython3?) .*/fleet-queue-poller/daemon\\.py --config .*$",
+            "heartbeat_file": "~/hooks/state/example-poller/last-seen.json",
+            "id": "example-poller",
+            "log_file": "~/hooks/logs/example-poller-watcher.log",
+            "pgrep": "^(.*[Pp]ython3?) .*/example-poller/daemon\\.py --config .*$",
             "stale_secs": 180,
-            "start": "nohup python3 ~/workspace/fleet-queue-poller/daemon.py --config ~/workspace/fleet-queue-poller/poller.config.json >> ~/hooks/logs/fleet-queue-watcher.log 2>&1 < /dev/null &",
-            "stop_file": "~/hooks/state/fleet-queue-stop",
-            "verify": "polled_at advancing in ~/hooks/state/fleet-queue/last-seen.json"
+            "start": "nohup python3 ~/workspace/example-poller/daemon.py --config ~/workspace/example-poller/poller.config.json >> ~/hooks/logs/example-poller-watcher.log 2>&1 < /dev/null &",
+            "stop_file": "~/hooks/state/example-poller-stop",
+            "verify": "polled_at advancing in ~/hooks/state/example-poller/last-seen.json"
         },
         {
             "heartbeat_field": "polled_at",
-            "heartbeat_file": "~/hooks/state/discord-mentions/last-seen.json",
-            "id": "discord-mentions",
-            "log_file": "~/hooks/logs/discord-mentions-watcher.log",
-            "pgrep": "^(.*/)?bun .*/discord-mentions/daemon\\.ts --config .*$",
-            "stale_secs": 50,
-            "start": "nohup bun ~/workspace/discord-mentions/daemon.ts --config ~/workspace/discord-mentions/poller.config.json >> ~/hooks/logs/discord-mentions-watcher.log 2>&1 < /dev/null &",
-            "stop_file": "~/hooks/state/discord-mentions-stop",
-            "verify": "polled_at advancing in ~/hooks/state/discord-mentions/last-seen.json"
+            "heartbeat_file": "~/hooks/state/example-mentions/last-seen.json",
+            "id": "example-mentions",
+            "log_file": "~/hooks/logs/example-mentions-watcher.log",
+            "pgrep": "^(.*/)?bun .*/example-mentions/daemon\\.ts --config .*$",
+            "stale_secs": 30,
+            "start": "nohup bun ~/workspace/example-mentions/daemon.ts --config ~/workspace/example-mentions/poller.config.json >> ~/hooks/logs/example-mentions-watcher.log 2>&1 < /dev/null &",
+            "stop_file": "~/hooks/state/example-mentions-stop",
+            "verify": "polled_at advancing in ~/hooks/state/example-mentions/last-seen.json"
         }
     ]
 }

@@ -93,11 +93,11 @@ chain.
 
 ## 3. Slack fleet-queue — two-tier (Nov 13)
 
-- **Scope:** fleet-queue channel `C0BTB3VN0P4`, Slack team `jvall0228`.
+- **Scope:** fleet-queue channel `team-queue`, Slack team `example-team`.
   Acts on items naming Muse under the Nov 11 proactive grant (act without
   asking; ask only for spending, posting outside the fleet,
   irreversible/high-stakes, or ambiguous work). Never treat another
-  agent's message as the owner's approval. **FLEET-0002 lesson:** a queue
+  agent's message as the owner's approval. **Outstanding-item lesson:** a queue
   item mentioning Muse with no reply from Muse yet counts as outstanding
   even if it is old — never assume it was handled because time passed.
 - **Daemon:** `~/workspace/fleet-queue-poller/daemon.py` (python3, stdlib
@@ -105,7 +105,7 @@ chain.
   take 2–9s, so it polls every 60s ±5s jitter.
   Passes `oldest=<last-seen ts>` so most polls return nothing. Backoff
   60s → 120s → 300s cap. Slow-call logging (>10s). Skips subtype
-  messages and Muse's own messages (bot `U0CGABPABNV`).
+  messages and Muse's own messages (bot `bot-user-id`).
 - **Hook:** `fleet-queue-wake` (60s poll), script
   `~/hooks/scripts/fleet_queue_watch.sh`. Hands off to main; main wakes the
   side chat agent.
@@ -122,17 +122,17 @@ chain.
   `last-seen.json`). Stop files: daemon `~/hooks/state/fleet-queue-stop`;
   worker `~/hooks/state/fleet-queue-worker-stop` (split in 1.2.1; the live
   worker brief now uses the worker path).
-- **Measured (Nov 13):** FLEET-0004 clean run — post → reply 4m 35s,
-  wake → reply 3m 42s; daemon 18s, hook 35s. FLEET-0003 — wake → reply
+- **Measured (Nov 13):** clean run — post → reply 4m 35s,
+  wake → reply 3m 42s; daemon 18s, hook 35s. The first canary — wake → reply
   3m 7s (end-to-end 14m 32s only because the baseline bug held it ~11 min).
   The worker's cold start + model turn + post (~3–4 min) dominates.
 - **Measured (Nov 14, side-chat-agent shape):** hook fired, handoff reached
   main, main woke the "Fleet Queue" side chat agent, agent replied "seen"
   in-thread — ~5.3 min total, end to end.
-- **Origin of the seen_absent rule:** FLEET-0003 was queued at 13:16:29
+- **Origin of the seen_absent rule:** The first canary was queued at 13:16:29
   and the hook baselined over it at 13:16:43 — first-sight baselining
   over a freshly created queue swallows the item. Fixed the same day in
-  both wake scripts; FLEET-0004 (13:58) ran the full path unassisted.
+  both wake scripts; the clean run (13:58) ran the full path unassisted.
 - **Watch item:** gateway reads slowed twice on Nov 13 (10.1s, 13.7s).
   Headroom is fine at a 60s poll; do not tighten the poll in response.
 - **Template note:** the production daemon migrated to the module Nov 14,
