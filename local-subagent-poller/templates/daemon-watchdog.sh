@@ -44,8 +44,10 @@
 #   - A polled_at that is present but unparsable (not ISO-8601 and not an
 #     epoch integer), or a heartbeat file that is not valid JSON at all:
 #     that entry is skipped and named in the reason; it is NOT counted
-#     healthy. A negative age (heartbeat written a second after this poll
-#     read the clock) is clamped to 0.
+#     healthy. Also unparseable: an empty file, a non-object, a null/false/
+#     array polled_at, epoch milliseconds, and a timestamp more than 60s in
+#     the future. Only a small negative age (heartbeat written a second
+#     after this poll read the clock) is clamped to 0.
 #   - Every entry skipped as a config error: the reason says "no daemons
 #     supervised — config errors: ..." rather than "all daemons healthy".
 #   - A daemon that never recovers (it wrote error.json on a 401 or
@@ -177,33 +179,55 @@ if ! jq -e '[.daemons[] | .pgrep // empty] | (unique | length) == length' "$REGI
 fi
 
 # heartbeat_age <file> <field>: seconds since polled_at (ISO-8601 or epoch
-# integer). Prints one of: a non-negative integer age (clamped to 0 — the
-# heartbeat may land after `now` was read); "absent" (file missing);
-# "nofield" (no polled_at — a daemon predating the heartbeat rule, so the
-# caller checks the process only); "unparseable" (present but unreadable —
-# a config/daemon problem the caller names, never counts healthy).
+# integer seconds). Prints one of: a non-negative integer age (a small
+# negative skew, up to HEARTBEAT_SKEW_SECS, is clamped to 0 — the heartbeat
+# may land after `now` was read); "absent" (file missing); "nofield" (the
+# file is a JSON object with no polled_at key at all — a daemon predating
+# the heartbeat rule, so the caller checks the process only);
+# "unparseable" (anything else that cannot be trusted: an empty or
+# non-JSON file, a non-object, a null/boolean/array/object value,
+# epoch milliseconds, or a timestamp further in the future than the skew
+# allows — a config/daemon problem the caller names, never counts healthy).
+# Timestamps are parsed in jq, so no GNU date is needed.
+HEARTBEAT_SKEW_SECS=60
 heartbeat_age() {
     local file="$1" field="${2:-polled_at}"
     [ -f "$file" ] || { echo absent; return; }
-    local ts
-    # A jq parse failure (heartbeat file not valid JSON at all) must not
-    # collapse to "nofield": an unreadable heartbeat is unparseable, never
-    # healthy. (The if-condition suppresses set -e, so a failing jq is read
-    # here instead of killing the poll.)
-    if ! ts=$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null); then
+    local out
+    # jq prints "nofield", "unparseable" or an integer epoch; no output at
+    # all (empty file) or a jq failure (invalid JSON) is unparseable too.
+    # The if-condition suppresses set -e, so a failing jq is read here.
+    if ! out=$(jq -r --arg f "$field" '
+        def iso_epoch:
+            capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<tz>Z|[+-][0-9]{2}:?[0-9]{2})$")
+            | (.base + "Z" | fromdateiso8601) as $e
+            | if .tz == "Z" then $e
+              else (.tz | sub(":"; "")) as $z
+                | ((($z[1:3] | tonumber) * 3600) + (($z[3:5] | tonumber) * 60)) as $off
+                | if $z[0:1] == "+" then $e - $off else $e + $off end
+              end;
+        if type != "object" then "unparseable"
+        elif has($f) | not then "nofield"
+        else .[$f] as $v
+            | (if ($v | type) == "number" then $v | floor
+               elif ($v | type) == "string" and ($v | test("^[0-9]+$")) then ($v | sub("^0+"; "") | if . == "" then 0 else tonumber end)
+               elif ($v | type) == "string" then ($v | try iso_epoch catch null)
+               else null end)
+            | if type == "number" and . > 0 then tostring else "unparseable" end
+        end' "$file" 2>/dev/null); then
         echo unparseable; return
     fi
-    [ -n "$ts" ] || { echo nofield; return; }
-    local t
-    case "$ts" in
-        *[!0-9]*) t=$(date -d "$ts" +%s 2>/dev/null || echo 0) ;;
-        *) t=$ts ;;
+    case "$out" in
+        nofield|unparseable) echo "$out"; return ;;
+        ''|*[!0-9]*) echo unparseable; return ;;
     esac
-    if [ "$t" -gt 0 ] 2>/dev/null; then
-        local age=$((now - t)); [ "$age" -ge 0 ] || age=0
-        echo "$age"
+    local age=$((now - out))
+    if [ "$age" -lt "-$HEARTBEAT_SKEW_SECS" ]; then
+        echo unparseable   # far-future: epoch ms, or a clock that cannot be right
+    elif [ "$age" -lt 0 ]; then
+        echo 0
     else
-        echo unparseable
+        echo "$age"
     fi
 }
 

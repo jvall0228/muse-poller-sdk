@@ -375,6 +375,40 @@ lacks "wd unparseable polled_at: not 'all daemons healthy'" "$(reason)" "all dae
 has "wd unparseable polled_at: nothing supervised" "$(reason)" "no daemons supervised"
 stop_fake
 
+# heartbeat validation: every untrustworthy polled_at is unparseable (named,
+# never healthy, never woken); only a genuinely missing key is process-only
+new_wd_case wd_hbval
+start_fake 307
+mkreg "$FAKE_PAT" "$D/last-seen.json" 30 ""
+hb_expect() { # hb_expect DESC FILE_CONTENT REASON_FRAGMENT
+    printf '%s' "$2" > "$D/last-seen.json"
+    run_hook
+    eq "wd heartbeat $1: silent" "$(kind)" silent
+    has "wd heartbeat $1: reason" "$(reason)" "$3"
+}
+hb_expect "empty file" "" "unparseable polled_at for fake"
+hb_expect "invalid JSON" "{not json" "unparseable polled_at for fake"
+hb_expect "non-object JSON" "[1,2]" "unparseable polled_at for fake"
+hb_expect "null polled_at" '{"polled_at":null}' "unparseable polled_at for fake"
+hb_expect "false polled_at" '{"polled_at":false}' "unparseable polled_at for fake"
+hb_expect "array polled_at" '{"polled_at":[1]}' "unparseable polled_at for fake"
+hb_expect "epoch milliseconds" "{\"polled_at\":$(date +%s)000}" "unparseable polled_at for fake"
+hb_expect "far-future ISO" '{"polled_at":"2099-01-01T00:00:00Z"}' "unparseable polled_at for fake"
+hb_expect "far-future epoch" "{\"polled_at\":$(( $(date +%s) + 3600 ))}" "unparseable polled_at for fake"
+hb_expect "missing key is process-only healthy" '{"other":1}' "all daemons healthy"
+hb_expect "small skew still healthy" "{\"polled_at\":$(( $(date +%s) + 20 ))}" "all daemons healthy"
+# leading-zero digits must not abort with an arithmetic error: old epoch -> stale wake
+printf '{"polled_at":"08"}' > "$D/last-seen.json"
+run_hook
+eq "wd leading-zero digits: wake as stale, no crash" "$(kind)" wake
+has "wd leading-zero digits: stale" "$(payload | jq -r .down.fake)" "heartbeat stale"
+# ISO with fraction and a non-UTC offset
+printf '{"polled_at":"%s"}' "$(jq -nr "now - 10 + 7200 | floor | todateiso8601 | sub(\"Z\$\"; \".250+02:00\")")" > "$D/last-seen.json"
+run_hook
+eq "wd ISO fraction + offset: healthy" "$(kind)" silent
+has "wd ISO fraction + offset: reason" "$(reason)" "all daemons healthy"
+stop_fake
+
 # missing heartbeat file with live process is still down, reason exact
 new_wd_case wd_nohb
 start_fake 304
