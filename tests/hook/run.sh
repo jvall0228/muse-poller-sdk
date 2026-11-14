@@ -179,7 +179,7 @@ new_wd_case() {
 }
 mkreg() { # mkreg PGREP HEARTBEAT_FILE STALE STOP_FILE ("" = null / none)
     jq -n --arg pg "$1" --arg hb "$2" --argjson st "$3" --arg sf "$4" \
-      '{daemons: [{id: "fake", pgrep: $pg, heartbeat_file: (if $hb == "" then null else $hb end), heartbeat_field: "polled_at", stale_secs: $st, stop_file: $sf, start: "setsid nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
+      '{daemons: [{id: "fake", pgrep: $pg, heartbeat_file: (if $hb == "" then null else $hb end), heartbeat_field: "polled_at", stale_secs: $st, stop_file: $sf, start: "nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
 }
 start_fake() { # start_fake SECS -> FAKE_PAT / FAKE_PID (a real process to pgrep)
     sleep "$1" & FAKE_PID=$!; BG_PIDS+=("$FAKE_PID"); FAKE_PAT="^sleep $1\$"
@@ -264,8 +264,8 @@ has "wd unanchored pattern: reason names it" "$(reason)" "unanchored pgrep patte
 # wake payload names only the daemon this wake covers
 new_wd_case wd_two
 jq -n '{daemons: [
-  {id: "a", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "setsid nohup sleep 300 &", verify: "process alive"},
-  {id: "b", pgrep: "^sleep 399$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "setsid nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
+  {id: "a", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "nohup sleep 300 &", verify: "process alive"},
+  {id: "b", pgrep: "^sleep 399$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "nohup sleep 300 &", verify: "process alive"}]}' > "$D/registry.json"
 printf '{"waking":{"a":%s}}' "$NOW" > "$D/state.json"
 run_hook
 eq "wd two daemons: wake" "$(kind)" wake
@@ -315,26 +315,28 @@ eq "wd bad id: silent" "$(kind)" silent
 has "wd bad id: reason names it" "$(reason)" "bad daemon id"
 
 # ---- watchdog hardening ----------------------------------------------------
-iso_in() { date -u -d "@$(( $(date +%s) + $1 ))" +%Y-%m-%dT%H:%M:%SZ; }
+iso_in() { jq -nr "now + $1 | floor | todateiso8601"; }   # portable: no GNU date -d
+# sed_inplace SCRIPT FILE — in-place edit that works with GNU and BSD sed
+sed_inplace() { sed -i.bak "$1" "$2" && rm -f "$2.bak"; }
 
 # bad / blank / non-numeric cooldown -> explicit silent reason, not false-quiet
 for bad in '10m' '' '-5'; do
     new_wd_case "wd_badcool_$RANDOM"
-    sed -i "s|^WAKE_COOLDOWN_SECS=.*|WAKE_COOLDOWN_SECS=\"$bad\"|" "$HOOK"
+    sed_inplace "s|^WAKE_COOLDOWN_SECS=.*|WAKE_COOLDOWN_SECS=\"$bad\"|" "$HOOK"
     mkreg "^sleep 399$" "" 0 ""
     run_hook
     eq "wd cooldown '$bad': silent" "$(kind)" silent
     has "wd cooldown '$bad': reason" "$(reason)" "WAKE_COOLDOWN_SECS"
 done
 new_wd_case wd_badcool_ph
-sed -i 's|^WAKE_COOLDOWN_SECS=.*|WAKE_COOLDOWN_SECS="{{WAKE_COOLDOWN_SECS}}"|' "$HOOK"
+sed_inplace 's|^WAKE_COOLDOWN_SECS=.*|WAKE_COOLDOWN_SECS="{{WAKE_COOLDOWN_SECS}}"|' "$HOOK"
 mkreg "^sleep 399$" "" 0 ""
 run_hook
 has "wd unfilled cooldown placeholder: reason" "$(reason)" "placeholder not filled"
 
 # registry path still a placeholder -> explicit reason
 new_wd_case wd_regph
-sed -i '0,/^REGISTRY=/s|^REGISTRY=.*|REGISTRY="{{REGISTRY_PATH}}"|' "$HOOK"
+sed_inplace '/^REGISTRY="[^$]/s|^REGISTRY=.*|REGISTRY="{{REGISTRY_PATH}}"|' "$HOOK"
 run_hook
 eq "wd unfilled registry placeholder: silent" "$(kind)" silent
 has "wd unfilled registry placeholder: reason" "$(reason)" "placeholder not filled"
@@ -342,7 +344,7 @@ has "wd unfilled registry placeholder: reason" "$(reason)" "placeholder not fill
 # registry path with a leading ~ is expanded against $HOME
 new_wd_case wd_tilde
 mkdir -p "$D/home"
-sed -i '0,/^REGISTRY=/s|^REGISTRY=.*|REGISTRY="~/registry.json"|' "$HOOK"
+sed_inplace '/^REGISTRY="[^$]/s|^REGISTRY=.*|REGISTRY="~/registry.json"|' "$HOOK"
 mkreg "^sleep 399$" "" 0 ""; mv "$D/registry.json" "$D/home/registry.json"
 run_hook "HOME=$D/home"
 eq "wd tilde registry: found and processed (wake, daemon down)" "$(kind)" wake
@@ -619,6 +621,33 @@ eq "wd grouped alternation: accepted (daemon down -> wake)" "$(kind)" wake
 mkreg '^sleep 777\$' "" 0 ""
 run_hook
 has "wd escaped final dollar: rejected" "$(reason)" "unanchored pgrep pattern for fake"
+
+# portability: no GNU date dependency (stock macOS has BSD date) and the
+# example registry's patterns match both python3 and macOS's framework Python
+new_wd_case wd_nogdate
+mkdir "$D/bin"
+printf '#!/bin/sh\ncase "$*" in *-d*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v date)" > "$D/bin/date"
+chmod +x "$D/bin/date"
+start_fake 312
+printf '{"polled_at":"%s"}' "$(iso_in -5)" > "$D/last-seen.json"
+mkreg "$FAKE_PAT" "$D/last-seen.json" 30 ""
+run_hook "PATH=$D/bin:$PATH"
+eq "wd without GNU date: ISO polled_at still parsed, healthy" "$(kind)" silent
+has "wd without GNU date: reason" "$(reason)" "all daemons healthy"
+stop_fake
+EX="$TPL/daemon-registry.example.json"
+pat=$(jq -r '.daemons[0].pgrep' "$EX")
+check "example pgrep matches python3 args" bash -c "printf '%s\n' 'python3 /opt/app/workspace/example-poller/daemon.py --config /c.json' | grep -Eq '$pat'"
+check "example pgrep matches macOS framework Python args" bash -c "printf '%s\n' '/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /opt/app/workspace/example-poller/daemon.py --config /c.json' | grep -Eq '$pat'"
+check "example pgrep rejects an unrelated script" bash -c "! printf '%s\n' 'python3 /x/other/daemon.py --config c' | grep -Eq '$pat'"
+check "example start commands do not use setsid" bash -c "! jq -r '.daemons[].start' '$EX' | grep -q setsid"
+# the example registry itself passes the watchdog's pattern validation
+new_wd_case wd_example
+cp "$EX" "$D/registry.json"
+run_hook
+lacks "wd example registry: patterns not rejected as unanchored" "$(reason)" "unanchored"
+lacks "wd example registry: patterns not rejected as invalid" "$(reason)" "invalid pgrep"
+check "brief does not instruct setsid" bash -c "! grep -E '^[^\`]*\bsetsid [a-z]' '$TPL/watchdog-worker-brief.md'"
 
 # the worker brief branches on the exact reasons the script emits
 BRIEF="$TPL/watchdog-worker-brief.md"

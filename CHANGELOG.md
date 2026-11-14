@@ -13,7 +13,7 @@ One watchdog supervises all daemons, and transparency is a decision at the resol
 ### Changed
 
 - **Recovery is a watchdog hook, not a cron.** The skill's Start-location rule, design.md's start-location rule and ADR-11 now say watchdog hook; the recovery cron is removed.
-- **Requirements:** the watchdog script needs `pgrep(1)` and GNU `date` (checked at startup; a missing one ends the poll silently with the reason).
+- **Requirements:** the watchdog script needs `pgrep(1)` and `jq` (checked at startup; a missing one ends the poll silently with the reason). It parses `polled_at` in `jq`, so GNU `date` is not required and it runs on stock macOS; the worker brief detaches a restart with a portable `python3` wrapper instead of `setsid`.
 - The review guide's template-fidelity check now covers the watchdog templates and the resolve section.
 
 ## 1.1.0 — 2026-11-13

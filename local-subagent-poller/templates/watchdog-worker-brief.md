@@ -90,19 +90,35 @@ nothing else; `heartbeat stale` is followed by the age in parentheses):
     `poll_failed`, so waking on one means the log was quiet when the hook
     checked; still apply the rule above to what you see now.
 
-**Start it FULLY DETACHED with setsid so it survives this agent turn** —
-run its start command from the registry entry as a foreground shell
-command ending in `&` (do NOT use the exec tool's background mode for the
-daemon itself: a background exec session is tied to this turn and gets
-killed when the turn ends, which is why the daemons kept dying every few
-minutes). Start it from this agent turn so it inherits a fresh network
-credential (never systemd — a systemd service can never hold a current
-credential and its daemon can't reach the network).
+**Start it FULLY DETACHED so it survives this agent turn.** The registry's
+`start` command is a shell line ending in `&` (nohup, output redirected to
+the daemon's log, stdin from /dev/null). Run it from this agent turn,
+in a new session, with this portable wrapper (it works on Linux and macOS;
+`setsid(1)` and `ps -o sid` do not exist on stock macOS):
 
-**After starting, verify it is fully detached:** `ps -o pid,ppid,sid,args`
-should show ppid 1 and sid equal to its own pid. Then wait
+    python3 -c 'import os, sys; os.fork() and os._exit(0); os.setsid(); os.execvp("sh", ["sh", "-c", sys.argv[1]])' '<the registry start command>'
+
+Run it as a foreground shell command (do NOT use the exec tool's
+background mode for the daemon itself: a background exec session is tied
+to this turn and gets killed when the turn ends, which is why the daemons
+kept dying every few minutes). Start it from this agent turn so it
+inherits a fresh network credential (never systemd — a systemd service
+can never hold a current credential and its daemon can't reach the
+network).
+
+**After starting, verify it is fully detached.** Find the new pid with
+`pgrep -f '<the entry's pattern>'`, then check
+`ps -o pid=,ppid=,args= -p <pid>` shows ppid 1 (or the system's
+subreaper — inside some containers it is not 1) and
+`python3 -c 'import os, sys; print(os.getsid(int(sys.argv[1])) != os.getsid(0))' <pid>`
+prints `True` (the daemon is not in this turn's session). Then wait
 {{VERIFY_WAIT_SECS}} seconds and verify it is polling: the entry's
 heartbeat file `polled_at` advancing (or the entry's `verify` hint).
+
+Platform notes: on macOS a framework Python can show in `ps -o args` as
+`.../Python.app/Contents/MacOS/Python script.py`, not `python3 script.py`,
+so the registry's `pgrep` pattern must not anchor on a bare `^python3`
+(the example allows either form). Use the entry's pattern verbatim.
 
 **Reporting (resolve).** Your exit report is a handoff-ready summary:
 which daemon was restarted, the new pid, and that it verified polling —

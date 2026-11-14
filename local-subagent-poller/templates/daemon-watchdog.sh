@@ -82,8 +82,9 @@
 #     the wake leaves the next poll free to retry, and a death after it
 #     only delays the next wake by the cooldown.
 #
-# Dependencies: bash, jq, pgrep (procps), GNU date (for -d on polled_at).
-# All are checked at startup; a missing one ends the poll silently with
+# Dependencies: bash, jq (1.6+, which also parses polled_at — no GNU date
+# needed), pgrep. Works on stock macOS (BSD date, /usr/bin/pgrep). jq and
+# pgrep are checked at startup; a missing one ends the poll silently with
 # the reason (the hook log shows it). See README Requirements.
 #
 # stale_secs per daemon is poll interval + first backoff step + call
@@ -92,9 +93,11 @@
 #
 # The pgrep pattern is matched against the FULL command line (`ps -o
 # args`), arguments included, and must be anchored at both ends: for the
-# SDK daemon that is e.g. ^python3 .*/daemon\.py --config .*$ . A pattern
-# that omits the arguments never matches, so the hook reports "process
-# missing" and the worker's own pgrep re-check misses the running daemon.
+# SDK daemon that is e.g. ^(.*[Pp]ython3?) .*/daemon\.py --config .*$ . Do
+# not anchor on a bare ^python3: on macOS a framework Python shows in `ps`
+# as .../Python.app/Contents/MacOS/Python script.py. A pattern that omits
+# the arguments never matches, so the hook reports "process missing" and
+# the worker's own pgrep re-check misses the running daemon.
 #
 # Placeholders:
 #   {{REGISTRY_PATH}}      — path to daemon-registry.json, absolute or with
@@ -136,9 +139,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 if ! command -v pgrep >/dev/null 2>&1; then
     silent "pgrep not installed; cannot check daemon processes" '{}'
-fi
-if ! date -d "@0" +%s >/dev/null 2>&1; then
-    silent "GNU date not available; cannot parse polled_at" '{}'
 fi
 
 case "$REGISTRY$WAKE_COOLDOWN_SECS" in
