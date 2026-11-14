@@ -26,6 +26,12 @@
 #     empty registry: silent with an explicit reason. There is nothing to
 #     supervise, so waking would spawn a worker with no work; the reason
 #     is visible in the hook log.
+#   - A live daemon with a stale (or missing) heartbeat whose `log_file`
+#     (optional registry field) ends in a recent `poll_failed` line is alive
+#     and backing off during a source outage, not hung: no wake, named in
+#     the reason as backing off. "Recent" = newer than that line's
+#     backoff_secs + stale_secs. A restart cannot fix an outage. A missing,
+#     unreadable or silent log, or one ending in anything else, wakes.
 #   - A pgrep pattern that is not a valid regex (pgrep exits 2): that
 #     entry is skipped and named in the reason. A bad pattern is a config
 #     error, not a down daemon — waking on it would loop every cooldown.
@@ -44,8 +50,10 @@
 #   - A polled_at that is present but unparsable (not ISO-8601 and not an
 #     epoch integer), or a heartbeat file that is not valid JSON at all:
 #     that entry is skipped and named in the reason; it is NOT counted
-#     healthy. A negative age (heartbeat written a second after this poll
-#     read the clock) is clamped to 0.
+#     healthy. Also unparseable: an empty file, a non-object, a null/false/
+#     array polled_at, epoch milliseconds, and a timestamp more than 60s in
+#     the future. Only a small negative age (heartbeat written a second
+#     after this poll read the clock) is clamped to 0.
 #   - Every entry skipped as a config error: the reason says "no daemons
 #     supervised — config errors: ..." rather than "all daemons healthy".
 #   - A daemon that never recovers (it wrote error.json on a 401 or
@@ -54,8 +62,10 @@
 #     WATCHDOG_MAX_CONSECUTIVE_WAKES env var) the hook goes silent for it
 #     with an explicit "gave up" reason instead of spending an agent turn
 #     every cooldown forever. The count lives in hook state (.wakes[id]);
-#     it resets when the daemon is seen healthy or intentionally stopped
-#     (create then remove its stop file to re-arm after fixing it).
+#     it resets once the daemon has stayed healthy for a full cooldown since
+#     its last wake (a flapping daemon that polls once and dies keeps its
+#     count), or at once when it is intentionally stopped (create then
+#     remove its stop file to re-arm after fixing it).
 #   - A heartbeat file that exists but carries no polled_at (a daemon
 #     predating the heartbeat rule): process-only check. The file's mtime
 #     is NEVER a liveness signal — an idle daemon whose state file only
@@ -67,13 +77,14 @@
 #     object) is normalised, never fatal.
 #   - If this script dies mid-run, nothing is lost: hook state is written
 #     before a wake (`.waking[<id>] = now`, `.wakes[<id>] += 1`) and, when a
-#     daemon is seen healthy, to clear its wake count and cooldown timestamp,
-#     so a death before
+#     daemon has stayed healthy for a cooldown, to clear its wake count and
+#     cooldown timestamp, so a death before
 #     the wake leaves the next poll free to retry, and a death after it
 #     only delays the next wake by the cooldown.
 #
-# Dependencies: bash, jq, pgrep (procps), GNU date (for -d on polled_at).
-# All are checked at startup; a missing one ends the poll silently with
+# Dependencies: bash, jq (1.6+, which also parses polled_at — no GNU date
+# needed), pgrep. Works on stock macOS (BSD date, /usr/bin/pgrep). jq and
+# pgrep are checked at startup; a missing one ends the poll silently with
 # the reason (the hook log shows it). See README Requirements.
 #
 # stale_secs per daemon is poll interval + first backoff step + call
@@ -82,9 +93,11 @@
 #
 # The pgrep pattern is matched against the FULL command line (`ps -o
 # args`), arguments included, and must be anchored at both ends: for the
-# SDK daemon that is e.g. ^python3 .*/daemon\.py --config .*$ . A pattern
-# that omits the arguments never matches, so the hook reports "process
-# missing" and the worker's own pgrep re-check misses the running daemon.
+# SDK daemon that is e.g. ^(.*[Pp]ython3?) .*/daemon\.py --config .*$ . Do
+# not anchor on a bare ^python3: on macOS a framework Python shows in `ps`
+# as .../Python.app/Contents/MacOS/Python script.py. A pattern that omits
+# the arguments never matches, so the hook reports "process missing" and
+# the worker's own pgrep re-check misses the running daemon.
 #
 # Placeholders:
 #   {{REGISTRY_PATH}}      — path to daemon-registry.json, absolute or with
@@ -126,9 +139,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 if ! command -v pgrep >/dev/null 2>&1; then
     silent "pgrep not installed; cannot check daemon processes" '{}'
-fi
-if ! date -d "@0" +%s >/dev/null 2>&1; then
-    silent "GNU date not available; cannot parse polled_at" '{}'
 fi
 
 case "$REGISTRY$WAKE_COOLDOWN_SECS" in
@@ -177,34 +187,86 @@ if ! jq -e '[.daemons[] | .pgrep // empty] | (unique | length) == length' "$REGI
 fi
 
 # heartbeat_age <file> <field>: seconds since polled_at (ISO-8601 or epoch
-# integer). Prints one of: a non-negative integer age (clamped to 0 — the
-# heartbeat may land after `now` was read); "absent" (file missing);
-# "nofield" (no polled_at — a daemon predating the heartbeat rule, so the
-# caller checks the process only); "unparseable" (present but unreadable —
-# a config/daemon problem the caller names, never counts healthy).
+# integer seconds). Prints one of: a non-negative integer age (a small
+# negative skew, up to HEARTBEAT_SKEW_SECS, is clamped to 0 — the heartbeat
+# may land after `now` was read); "absent" (file missing); "nofield" (the
+# file is a JSON object with no polled_at key at all — a daemon predating
+# the heartbeat rule, so the caller checks the process only);
+# "unparseable" (anything else that cannot be trusted: an empty or
+# non-JSON file, a non-object, a null/boolean/array/object value,
+# epoch milliseconds, or a timestamp further in the future than the skew
+# allows — a config/daemon problem the caller names, never counts healthy).
+# Timestamps are parsed in jq, so no GNU date is needed.
+# jq definition shared by the heartbeat and log-line timestamp parsers.
+# shellcheck disable=SC2016
+JQ_ISO='def iso_epoch:
+    capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<tz>Z|[+-][0-9]{2}:?[0-9]{2})$")
+    | (.base + "Z" | fromdateiso8601) as $e
+    | if .tz == "Z" then $e
+      else (.tz | sub(":"; "")) as $z
+        | ((($z[1:3] | tonumber) * 3600) + (($z[3:5] | tonumber) * 60)) as $off
+        | if $z[0:1] == "+" then $e - $off else $e + $off end
+      end;
+'
+
+HEARTBEAT_SKEW_SECS=60
 heartbeat_age() {
     local file="$1" field="${2:-polled_at}"
     [ -f "$file" ] || { echo absent; return; }
-    local ts
-    # A jq parse failure (heartbeat file not valid JSON at all) must not
-    # collapse to "nofield": an unreadable heartbeat is unparseable, never
-    # healthy. (The if-condition suppresses set -e, so a failing jq is read
-    # here instead of killing the poll.)
-    if ! ts=$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null); then
+    local out
+    # jq prints "nofield", "unparseable" or an integer epoch; no output at
+    # all (empty file) or a jq failure (invalid JSON) is unparseable too.
+    # The if-condition suppresses set -e, so a failing jq is read here.
+    if ! out=$(jq -r --arg f "$field" "$JQ_ISO"'
+        if type != "object" then "unparseable"
+        elif has($f) | not then "nofield"
+        else .[$f] as $v
+            | (if ($v | type) == "number" then $v | floor
+               elif ($v | type) == "string" and ($v | test("^[0-9]+$")) then ($v | sub("^0+"; "") | if . == "" then 0 else tonumber end)
+               elif ($v | type) == "string" then ($v | try iso_epoch catch null)
+               else null end)
+            | if type == "number" and . > 0 then tostring else "unparseable" end
+        end' "$file" 2>/dev/null); then
         echo unparseable; return
     fi
-    [ -n "$ts" ] || { echo nofield; return; }
-    local t
-    case "$ts" in
-        *[!0-9]*) t=$(date -d "$ts" +%s 2>/dev/null || echo 0) ;;
-        *) t=$ts ;;
+    case "$out" in
+        nofield|unparseable) echo "$out"; return ;;
+        ''|*[!0-9]*) echo unparseable; return ;;
     esac
-    if [ "$t" -gt 0 ] 2>/dev/null; then
-        local age=$((now - t)); [ "$age" -ge 0 ] || age=0
-        echo "$age"
+    local age=$((now - out))
+    if [ "$age" -lt "-$HEARTBEAT_SKEW_SECS" ]; then
+        echo unparseable   # far-future: epoch ms, or a clock that cannot be right
+    elif [ "$age" -lt 0 ]; then
+        echo 0
     else
-        echo unparseable
+        echo "$age"
     fi
+}
+
+# log_backoff <log_file> <stale_secs>: succeeds, printing "attempt N", when
+# the daemon's log shows it alive and backing off: its LAST line is a
+# poll_failed event (the daemon logs attempt and backoff_secs) newer than
+# backoff_secs + stale_secs. stale_secs already covers poll interval + first
+# backoff step + call timeout, so the sum outlasts the gap between two
+# consecutive poll_failed lines at any backoff step. A log that is missing,
+# unreadable, silent for longer, or ends in anything else fails: the
+# caller treats the daemon as down.
+log_backoff() {
+    local file="$1" stale="$2" last fields ts bo attempt
+    [ -f "$file" ] || return 1
+    last=$(tail -n 1 "$file" 2>/dev/null) || return 1
+    fields=$(printf '%s' "$last" | jq -r "$JQ_ISO"'
+        if type == "object" and .event == "poll_failed" and (.ts | type) == "string"
+           and (.backoff_secs | type) == "number" and .backoff_secs >= 0 and .backoff_secs < 86400
+        then [(.ts | try iso_epoch catch 0), (.backoff_secs | floor),
+              ((.attempt // 0) | if type == "number" then floor else 0 end)] | @tsv
+        else empty end' 2>/dev/null) || return 1
+    [ -n "$fields" ] || return 1
+    IFS=$'\t' read -r ts bo attempt <<< "$fields"
+    case "$ts$bo$attempt" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$ts" -gt 0 ] || return 1
+    [ $((now - ts)) -le $((bo + stale)) ] || return 1
+    echo "attempt $attempt"
 }
 
 # anchored_ok <pattern>: succeeds only if the pattern is anchored ^...$ AND
@@ -239,7 +301,9 @@ down_json='{}'   # {id: reason} for daemons found down
 stopped_list=""  # ids intentionally stopped
 notes=""         # config problems worth naming in the reason (bad patterns)
 healthy=0
-healthy_ids=""   # ids seen healthy or intentionally stopped (wake count reset)
+healthy_ids=""   # ids seen healthy (wake count reset once healthy for a cooldown)
+backing_off=""   # ids alive with a stale heartbeat but a log of recent poll_failed
+stopped_ids=""   # ids intentionally stopped (wake count reset at once)
 
 while IFS= read -r entry; do
     id=$(printf '%s' "$entry" | jq -r '.id')
@@ -248,8 +312,9 @@ while IFS= read -r entry; do
     hb_field=$(printf '%s' "$entry" | jq -r '.heartbeat_field // "polled_at"')
     stale=$(printf '%s' "$entry" | jq -r '.stale_secs // 0')
     stop_file=$(printf '%s' "$entry" | jq -r '.stop_file // empty')
+    log_file=$(printf '%s' "$entry" | jq -r '.log_file // empty')
     # Expand a leading ~ in paths (jq returns the literal string).
-    hb_file="${hb_file/#\~/$HOME}"; stop_file="${stop_file/#\~/$HOME}"
+    hb_file="${hb_file/#\~/$HOME}"; stop_file="${stop_file/#\~/$HOME}"; log_file="${log_file/#\~/$HOME}"
 
     # Validate the entry before acting on it. A missing id, a missing
     # pgrep pattern, or a heartbeat file with a missing/zero/non-numeric
@@ -275,7 +340,7 @@ while IFS= read -r entry; do
 
     if [ -n "$stop_file" ] && [ -f "$stop_file" ]; then
         stopped_list="$stopped_list $id"  # intentionally stopped — skip
-        healthy_ids="$healthy_ids $id"
+        stopped_ids="$stopped_ids $id"
         continue
     fi
 
@@ -307,11 +372,19 @@ while IFS= read -r entry; do
     if [ -n "$hb_file" ]; then
         age=$(heartbeat_age "$hb_file" "$hb_field")
         if [ "$age" = "absent" ]; then
-            down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" '. + {($id): "process alive but no heartbeat file"}')
+            if [ -n "$log_file" ] && bo=$(log_backoff "$log_file" "$stale"); then
+                healthy=$((healthy + 1)); backing_off="$backing_off $id($bo)"  # alive, source failing
+            else
+                down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" '. + {($id): "process alive but no heartbeat file"}')
+            fi
         elif [ "$age" = "unparseable" ]; then
             notes="${notes:+$notes; }unparseable $hb_field for $id"  # not healthy, not woken
         elif [ "$age" != "nofield" ] && [ "$stale" -gt 0 ] && [ "$age" -gt "$stale" ]; then
-            down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" --argjson a "$age" '. + {($id): ("heartbeat stale (" + ($a|tostring) + "s old)")}')
+            if [ -n "$log_file" ] && bo=$(log_backoff "$log_file" "$stale"); then
+                healthy=$((healthy + 1)); backing_off="$backing_off $id($bo)"  # alive, source failing
+            else
+                down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" --argjson a "$age" '. + {($id): ("heartbeat stale (" + ($a|tostring) + "s old)")}')
+            fi
         else
             healthy=$((healthy + 1))  # fresh heartbeat, or no polled_at yet (process-only)
             healthy_ids="$healthy_ids $id"
@@ -322,28 +395,53 @@ while IFS= read -r entry; do
     fi
 done < <(jq -c '.daemons[]' "$REGISTRY")
 
-# A daemon seen healthy (or intentionally stopped) starts its wake count
-# over and clears its cooldown timestamp, so a daemon that recovers then
-# dies again is woken promptly instead of waiting out the old cooldown.
-# Persist only when something actually changes.
-for id in $healthy_ids; do
-    if [ "$(printf '%s' "$state" | jq -r --arg d "$id" '(has("wakes") and (.wakes | has($d))) or (has("waking") and (.waking | has($d)))')" = "true" ]; then
-        state=$(printf '%s' "$state" | jq -c --arg d "$id" 'del(.wakes[$d], .waking[$d])')
+# last_wake_of <id>: the daemon's last wake time as a plain integer. A
+# non-number, a fractional or exponent value (jq would print 1E+3), or a
+# timestamp in the future (the clock stepped back) must not break the
+# arithmetic or pin the daemon in cooldown forever: non-numbers and future
+# values read as 0 (never woken), fractions are floored.
+last_wake_of() {
+    printf '%s' "$state" | jq -r --arg d "$1" --argjson now "$now" \
+        '(.waking[$d] // 0) | if type == "number" and . <= $now then (floor | if . < 0 then 0 else . end) else 0 end'
+}
+
+# Resetting a daemon's wake count and cooldown. An intentionally stopped
+# daemon is reset at once (the owner stopped it; creating then removing the
+# stop file re-arms it). A daemon seen healthy is reset only after it has
+# stayed healthy for a full cooldown since its last wake: a flapping daemon
+# (polls once, then dies) must keep its count and cooldown, or it would be
+# woken forever and MAX_CONSECUTIVE_WAKES would never trip. Persist only
+# when something actually changes.
+clear_wake_state() { # clear_wake_state ID
+    if [ "$(printf '%s' "$state" | jq -r --arg d "$1" '(has("wakes") and (.wakes | has($d))) or (has("waking") and (.waking | has($d)))')" = "true" ]; then
+        state=$(printf '%s' "$state" | jq -c --arg d "$1" 'del(.wakes[$d], .waking[$d])')
         set_state "$state"
+    fi
+}
+for id in $stopped_ids; do
+    clear_wake_state "$id"
+done
+for id in $healthy_ids; do
+    last_wake=$(last_wake_of "$id")
+    if [ $((now - last_wake)) -ge "$WAKE_COOLDOWN_SECS" ]; then
+        clear_wake_state "$id"
     fi
 done
 
 if [ "$(printf '%s' "$down_json" | jq 'length')" -eq 0 ]; then
+    bo_note="${backing_off:+; alive but backing off after failed polls (do not restart):${backing_off}}"
     if [ -n "${stopped_list// }" ]; then
         if [ "$healthy" -gt 0 ]; then
-            silent "all running daemons healthy; intentionally stopped:${stopped_list}${notes:+; $notes}" '{}'
+            silent "all running daemons healthy; intentionally stopped:${stopped_list}${notes:+; $notes}${bo_note}" '{}'
         else
             silent "all daemons intentionally stopped:${stopped_list}${notes:+; $notes}" '{}'
         fi
     elif [ "$healthy" -eq 0 ]; then
         silent "no daemons supervised — config errors: ${notes:-none recorded}" '{}'
     elif [ -n "$notes" ]; then
-        silent "$healthy healthy, others skipped: $notes" '{}'
+        silent "$healthy healthy, others skipped: $notes${bo_note}" '{}'
+    elif [ -n "$backing_off" ]; then
+        silent "daemons alive; backing off after failed polls (source outage, not a restart case):${backing_off}" '{}'
     else
         silent "all daemons healthy" '{}'
     fi
@@ -356,8 +454,8 @@ fi
 wake_list=""
 gave_up=""
 while IFS= read -r id; do
-    last_wake=$(printf '%s' "$state" | jq -r --arg d "$id" '(.waking[$d] // 0) | if type == "number" then . else 0 end')
-    wakes=$(printf '%s' "$state" | jq -r --arg d "$id" '(.wakes[$d] // 0) | if type == "number" then floor else 0 end')
+    last_wake=$(last_wake_of "$id")
+    wakes=$(printf '%s' "$state" | jq -r --arg d "$id" '(.wakes[$d] // 0) | if type == "number" then ([., 0] | max | [., 1000000] | min | floor) else 0 end')
     if [ $((now - last_wake)) -lt "$WAKE_COOLDOWN_SECS" ]; then
         continue  # a worker is already on it
     elif [ "$wakes" -ge "$MAX_CONSECUTIVE_WAKES" ]; then

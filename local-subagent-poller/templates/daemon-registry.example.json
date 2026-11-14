@@ -4,9 +4,10 @@
             "heartbeat_field": "polled_at",
             "heartbeat_file": "~/hooks/state/example-poller/last-seen.json",
             "id": "example-poller",
-            "pgrep": "^python3 .*/example-poller/daemon\\.py --config .*$",
+            "log_file": "~/hooks/logs/example-poller-watcher.log",
+            "pgrep": "^(.*[Pp]ython3?) .*/example-poller/daemon\\.py --config .*$",
             "stale_secs": 180,
-            "start": "setsid nohup python3 ~/workspace/example-poller/daemon.py --config ~/workspace/example-poller/poller.config.json >> ~/hooks/logs/example-poller-watcher.log 2>&1 < /dev/null &",
+            "start": "nohup python3 ~/workspace/example-poller/daemon.py --config ~/workspace/example-poller/poller.config.json >> ~/hooks/logs/example-poller-watcher.log 2>&1 < /dev/null &",
             "stop_file": "~/hooks/state/example-poller-stop",
             "verify": "polled_at advancing in ~/hooks/state/example-poller/last-seen.json"
         },
@@ -14,9 +15,10 @@
             "heartbeat_field": "polled_at",
             "heartbeat_file": "~/hooks/state/example-mentions/last-seen.json",
             "id": "example-mentions",
-            "pgrep": "^bun .*/example-mentions/daemon\\.ts --config .*$",
+            "log_file": "~/hooks/logs/example-mentions-watcher.log",
+            "pgrep": "^(.*/)?bun .*/example-mentions/daemon\\.ts --config .*$",
             "stale_secs": 30,
-            "start": "setsid nohup bun ~/workspace/example-mentions/daemon.ts --config ~/workspace/example-mentions/poller.config.json >> ~/hooks/logs/example-mentions-watcher.log 2>&1 < /dev/null &",
+            "start": "nohup bun ~/workspace/example-mentions/daemon.ts --config ~/workspace/example-mentions/poller.config.json >> ~/hooks/logs/example-mentions-watcher.log 2>&1 < /dev/null &",
             "stop_file": "~/hooks/state/example-mentions-stop",
             "verify": "polled_at advancing in ~/hooks/state/example-mentions/last-seen.json"
         }

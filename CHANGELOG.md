@@ -10,10 +10,16 @@ One watchdog supervises all daemons, and transparency is a decision at the resol
 - **Transparency: the resolve gate.** Both worker briefs gain `{{RESOLVE_MODE}}` (`always` / `on-unexpected`, default) and a "Reporting (resolve)" section: the exit report ends in a verdict line (ACTED / UNEXPECTED / FAILED / ROUTINE). The hook prompt's load-bearing requirements are now six: the worker brief carries a RESOLVE instruction, and the spawner confirms it is there and resolves the verdict line. One persistent side chat per poller relays handoffs visibly (ADR-16).
 - **Hook tests for the watchdog.** `tests/hook/run.sh` exercises the watchdog's eight dry-run states and its config-error, clock-skew, backoff and brief-reason edge cases against the stub runtime.
 
+### Fixed (watchdog hardening)
+
+- A flapping daemon (polls once, then dies) can no longer be woken forever: the wake count and cooldown reset only after the daemon has stayed healthy for a full cooldown since its last wake, so `MAX_CONSECUTIVE_WAKES` trips.
+- `polled_at` validation is strict: an empty file, `null`/`false`/non-scalar values, epoch milliseconds and far-future timestamps are `unparseable`, not healthy; only a missing key is process-only. A leading-zero digit string no longer aborts the poll. A `.waking` value that is fractional, exponent-form or in the future no longer pins a daemon in cooldown.
+- A live daemon backing off during a source outage is no longer killed. The registry gains `log_file`; the watchdog stays silent (and says "backing off") when the log ends in a recent `poll_failed`, and the worker brief tells the worker not to kill in that case.
+
 ### Changed
 
 - **Recovery is a watchdog hook, not a cron.** The skill's Start-location rule, design.md's start-location rule and ADR-11 now say watchdog hook; the recovery cron is removed.
-- **Requirements:** the watchdog script needs `pgrep(1)` and GNU `date` (checked at startup; a missing one ends the poll silently with the reason).
+- **Requirements:** the watchdog script needs `pgrep(1)` and `jq` (checked at startup; a missing one ends the poll silently with the reason). It parses `polled_at` in `jq`, so GNU `date` is not required and it runs on stock macOS; the worker brief detaches a restart with a portable `python3` wrapper instead of `setsid`.
 - The review guide's template-fidelity check now covers the watchdog templates and the resolve section.
 
 ## 1.1.0 — 2026-11-13

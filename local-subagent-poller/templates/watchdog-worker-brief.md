@@ -31,7 +31,8 @@ nothing else; `heartbeat stale` is followed by the age in parentheses):
 
 - `process missing` — no process matches the entry's `pgrep` pattern.
 - `heartbeat stale` — a process is running but `polled_at` is older than
-  the entry's `stale_secs`: the daemon is hung or wedged, not dead.
+  the entry's `stale_secs`: the daemon is hung or wedged, or alive and backing off
+  (see below) — not dead.
 - `process alive but no heartbeat file` — a process is running but the
   heartbeat file does not exist: it never completed a poll.
 
@@ -59,28 +60,65 @@ nothing else; `heartbeat stale` is followed by the age in parentheses):
 - **`heartbeat stale` / `process alive but no heartbeat file`** — a
   matching process IS running, so "never start a second copy" means you
   must not just start another. First re-read `polled_at` (and re-run
-  `pgrep`): the daemon may be sitting in a legitimate backoff step or may
-  have just recovered. If the heartbeat is now fresh (within `stale_secs`),
-  nothing is wrong: this is ROUTINE. If it is still stale or still missing,
-  the daemon is hung: terminate the matching process (SIGTERM, then SIGKILL
-  after a few seconds if it is still there), confirm with `pgrep` that no
-  process matches any more, and only then start it from the registry's
-  `start` command. If you cannot confirm the old process is gone, do NOT
-  start a second copy: report `VERDICT: FAILED`.
+  `pgrep`): the daemon may have just recovered. If the heartbeat is now
+  fresh (within `stale_secs`), nothing is wrong: this is ROUTINE.
 
-**Start it FULLY DETACHED with setsid so it survives this agent turn** —
-run its start command from the registry entry as a foreground shell
-command ending in `&` (do NOT use the exec tool's background mode for the
-daemon itself: a background exec session is tied to this turn and gets
-killed when the turn ends, which is why the daemons kept dying every few
-minutes). Start it from this agent turn so it inherits a fresh network
-credential (never systemd — a systemd service can never hold a current
-credential and its daemon can't reach the network).
+  If it is still stale or missing, do NOT assume it is hung. A daemon
+  backing off during a source outage is alive and correctly sleeping, and
+  its heartbeat can stay stale for far longer than `stale_secs` (which only
+  covers the first backoff step). Read the tail of the entry's `log_file`
+  (JSON lines; `tail -n 20`). The daemon logs a `poll_failed` event with
+  `attempt` and `backoff_secs` after each failed poll, and `poll_ok` after
+  a good one:
+  - The last lines are `poll_failed` events newer than that line's
+    `backoff_secs` plus the entry's `stale_secs` (compare each event's `ts`
+    with the current time): the daemon is **alive and backing off**. Do NOT
+    kill it — a restart cannot fix a source outage and resets its backoff.
+    Report `VERDICT: FAILED` with a one-line error status (the daemon id,
+    "backing off", and the last `attempt`; never the `error` text).
+  - The log is missing, or silent for longer than the largest
+    `backoff_steps_secs` step in the daemon's config plus its
+    `call_timeout_secs` (or, if the log is unreadable, longer than the
+    largest `backoff_secs` you saw plus `stale_secs`), or its last line is
+    not a `poll_failed`: the daemon is hung. Terminate the matching process
+    (SIGTERM, then SIGKILL after a few seconds if it is still there),
+    confirm with `pgrep` that no process matches any more, and only then
+    start it from the registry's `start` command. If you cannot confirm the
+    old process is gone, do NOT start a second copy: report
+    `VERDICT: FAILED`.
+  - The watchdog already skips a daemon whose log ends in a recent
+    `poll_failed`, so waking on one means the log was quiet when the hook
+    checked; still apply the rule above to what you see now.
 
-**After starting, verify it is fully detached:** `ps -o pid,ppid,sid,args`
-should show ppid 1 and sid equal to its own pid. Then wait
+**Start it FULLY DETACHED so it survives this agent turn.** The registry's
+`start` command is a shell line ending in `&` (nohup, output redirected to
+the daemon's log, stdin from /dev/null). Run it from this agent turn,
+in a new session, with this portable wrapper (it works on Linux and macOS;
+`setsid(1)` and `ps -o sid` do not exist on stock macOS):
+
+    python3 -c 'import os, sys; os.fork() and os._exit(0); os.setsid(); os.execvp("sh", ["sh", "-c", sys.argv[1]])' '<the registry start command>'
+
+Run it as a foreground shell command (do NOT use the exec tool's
+background mode for the daemon itself: a background exec session is tied
+to this turn and gets killed when the turn ends, which is why the daemons
+kept dying every few minutes). Start it from this agent turn so it
+inherits a fresh network credential (never systemd — a systemd service
+can never hold a current credential and its daemon can't reach the
+network).
+
+**After starting, verify it is fully detached.** Find the new pid with
+`pgrep -f '<the entry's pattern>'`, then check
+`ps -o pid=,ppid=,args= -p <pid>` shows ppid 1 (or the system's
+subreaper — inside some containers it is not 1) and
+`python3 -c 'import os, sys; print(os.getsid(int(sys.argv[1])) != os.getsid(0))' <pid>`
+prints `True` (the daemon is not in this turn's session). Then wait
 {{VERIFY_WAIT_SECS}} seconds and verify it is polling: the entry's
 heartbeat file `polled_at` advancing (or the entry's `verify` hint).
+
+Platform notes: on macOS a framework Python can show in `ps -o args` as
+`.../Python.app/Contents/MacOS/Python script.py`, not `python3 script.py`,
+so the registry's `pgrep` pattern must not anchor on a bare `^python3`
+(the example allows either form). Use the entry's pattern verbatim.
 
 **Reporting (resolve).** Your exit report is a handoff-ready summary:
 which daemon was restarted, the new pid, and that it verified polling —
@@ -103,7 +141,8 @@ The verdict line is the last line of your report, exactly one of:
 - ACTED: you restarted a daemon (after killing a hung one, if needed)
   and it verified polling.
 - FAILED: a daemon would not stay up, a restart failed, `error.json`
-  reported an auth error, or you could not confirm a hung process was
+  reported an auth error, the daemon is alive but backing off after failed
+  polls (you left it running), or you could not confirm a hung process was
   gone — report it as a problem needing attention instead of retrying
   forever. (The hook also stops waking you for a daemon after a few
   consecutive wakes without recovery; a FAILED report is how the owner
@@ -121,6 +160,9 @@ The verdict line is the last line of your report, exactly one of:
 
 - **Never restart an intentionally stopped daemon.** The stop file is the
   owner's word; the hook should have skipped it.
+- **Never kill a daemon that is backing off.** A recent `poll_failed` in
+  its `log_file` means alive and waiting out a source outage; report it,
+  do not restart it.
 - **Never start a second copy.** Check `pgrep` again immediately before
   starting. For `process missing`, a running match means do nothing more;
   for a stale or missing heartbeat, kill the hung process and confirm it
