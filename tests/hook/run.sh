@@ -498,6 +498,44 @@ eq "wd backoff reset: count cleared" "$(state '.wakes.fake // "none"')" none
 eq "wd backoff reset: other ids untouched" "$(state .wakes.other)" 2
 stop_fake
 
+# flapping daemon (wake -> healthy once -> down again): the healthy sighting
+# inside the cooldown must NOT reset the count or the cooldown
+new_wd_case wd_flap
+start_fake 308
+mkreg "$FAKE_PAT" "" 0 ""
+echo "{\"waking\":{\"fake\":$((NOW - 100))},\"wakes\":{\"fake\":2}}" > "$D/state.json"
+run_hook
+eq "wd flap: healthy sighting inside cooldown is silent" "$(kind)" silent
+eq "wd flap: wake count kept" "$(state .wakes.fake)" 2
+eq "wd flap: cooldown timestamp kept" "$(state .waking.fake)" "$((NOW - 100))"
+stop_fake
+mkreg "^sleep 398$" "" 0 ""   # the daemon dies again, still inside the cooldown
+run_hook
+eq "wd flap: second death inside cooldown is not an instant wake" "$(kind)" silent
+has "wd flap: reads as cooldown" "$(reason)" "already in progress"
+# once the cooldown has passed the count still stands, so it reaches give-up
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":3}}" > "$D/state.json"
+run_hook
+has "wd flap: count survives to the give-up limit" "$(reason)" "gave up waking for fake"
+# healthy for a full cooldown since the last wake: both keys cleared
+new_wd_case wd_flap_ok
+start_fake 309
+mkreg "$FAKE_PAT" "" 0 ""
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":3},\"keep\":1}" > "$D/state.json"
+run_hook
+eq "wd flap: long-healthy daemon silent" "$(kind)" silent
+eq "wd flap: .wakes cleared after cooldown" "$(state '.wakes | has("fake")')" false
+eq "wd flap: .waking cleared after cooldown" "$(state '.waking | has("fake")')" false
+eq "wd flap: unrelated state kept" "$(state .keep)" 1
+stop_fake
+# an intentionally stopped daemon is reset at once
+new_wd_case wd_stop_reset
+mkreg "^sleep 399$" "" 0 "$D/fake-stop"
+touch "$D/fake-stop"
+echo "{\"waking\":{\"fake\":$NOW},\"wakes\":{\"fake\":2}}" > "$D/state.json"
+run_hook
+eq "wd stopped: wake keys cleared immediately" "$(state '(.wakes | has("fake")) or (.waking | has("fake"))')" false
+
 # alternation: an unparenthesised | leaves one branch unanchored
 new_wd_case wd_alt
 mkreg '^nope|sleep 777$' "" 0 ""

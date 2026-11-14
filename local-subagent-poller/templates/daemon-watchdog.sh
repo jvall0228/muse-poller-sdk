@@ -56,8 +56,10 @@
 #     WATCHDOG_MAX_CONSECUTIVE_WAKES env var) the hook goes silent for it
 #     with an explicit "gave up" reason instead of spending an agent turn
 #     every cooldown forever. The count lives in hook state (.wakes[id]);
-#     it resets when the daemon is seen healthy or intentionally stopped
-#     (create then remove its stop file to re-arm after fixing it).
+#     it resets once the daemon has stayed healthy for a full cooldown since
+#     its last wake (a flapping daemon that polls once and dies keeps its
+#     count), or at once when it is intentionally stopped (create then
+#     remove its stop file to re-arm after fixing it).
 #   - A heartbeat file that exists but carries no polled_at (a daemon
 #     predating the heartbeat rule): process-only check. The file's mtime
 #     is NEVER a liveness signal — an idle daemon whose state file only
@@ -69,8 +71,8 @@
 #     object) is normalised, never fatal.
 #   - If this script dies mid-run, nothing is lost: hook state is written
 #     before a wake (`.waking[<id>] = now`, `.wakes[<id>] += 1`) and, when a
-#     daemon is seen healthy, to clear its wake count and cooldown timestamp,
-#     so a death before
+#     daemon has stayed healthy for a cooldown, to clear its wake count and
+#     cooldown timestamp, so a death before
 #     the wake leaves the next poll free to retry, and a death after it
 #     only delays the next wake by the cooldown.
 #
@@ -263,7 +265,8 @@ down_json='{}'   # {id: reason} for daemons found down
 stopped_list=""  # ids intentionally stopped
 notes=""         # config problems worth naming in the reason (bad patterns)
 healthy=0
-healthy_ids=""   # ids seen healthy or intentionally stopped (wake count reset)
+healthy_ids=""   # ids seen healthy (wake count reset once healthy for a cooldown)
+stopped_ids=""   # ids intentionally stopped (wake count reset at once)
 
 while IFS= read -r entry; do
     id=$(printf '%s' "$entry" | jq -r '.id')
@@ -299,7 +302,7 @@ while IFS= read -r entry; do
 
     if [ -n "$stop_file" ] && [ -f "$stop_file" ]; then
         stopped_list="$stopped_list $id"  # intentionally stopped — skip
-        healthy_ids="$healthy_ids $id"
+        stopped_ids="$stopped_ids $id"
         continue
     fi
 
@@ -346,14 +349,26 @@ while IFS= read -r entry; do
     fi
 done < <(jq -c '.daemons[]' "$REGISTRY")
 
-# A daemon seen healthy (or intentionally stopped) starts its wake count
-# over and clears its cooldown timestamp, so a daemon that recovers then
-# dies again is woken promptly instead of waiting out the old cooldown.
-# Persist only when something actually changes.
-for id in $healthy_ids; do
-    if [ "$(printf '%s' "$state" | jq -r --arg d "$id" '(has("wakes") and (.wakes | has($d))) or (has("waking") and (.waking | has($d)))')" = "true" ]; then
-        state=$(printf '%s' "$state" | jq -c --arg d "$id" 'del(.wakes[$d], .waking[$d])')
+# Resetting a daemon's wake count and cooldown. An intentionally stopped
+# daemon is reset at once (the owner stopped it; creating then removing the
+# stop file re-arms it). A daemon seen healthy is reset only after it has
+# stayed healthy for a full cooldown since its last wake: a flapping daemon
+# (polls once, then dies) must keep its count and cooldown, or it would be
+# woken forever and MAX_CONSECUTIVE_WAKES would never trip. Persist only
+# when something actually changes.
+clear_wake_state() { # clear_wake_state ID
+    if [ "$(printf '%s' "$state" | jq -r --arg d "$1" '(has("wakes") and (.wakes | has($d))) or (has("waking") and (.waking | has($d)))')" = "true" ]; then
+        state=$(printf '%s' "$state" | jq -c --arg d "$1" 'del(.wakes[$d], .waking[$d])')
         set_state "$state"
+    fi
+}
+for id in $stopped_ids; do
+    clear_wake_state "$id"
+done
+for id in $healthy_ids; do
+    last_wake=$(printf '%s' "$state" | jq -r --arg d "$id" '(.waking[$d] // 0) | if type == "number" then . else 0 end')
+    if [ $((now - last_wake)) -ge "$WAKE_COOLDOWN_SECS" ]; then
+        clear_wake_state "$id"
     fi
 done
 
