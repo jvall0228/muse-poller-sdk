@@ -73,7 +73,7 @@ Two details in that sequence do most of the reliability work. First, the hook **
 
 ### The side-chat-agent worker (1.3.0)
 
-Since 1.3.0 the worker is not a fresh subagent spawned per wake. It is a **side chat agent living in the poller's dedicated side chat** — that chat is its home, its brief lives there as a message (the chat brief is the source of truth; a file copy is a superseded fallback), and its exit report is its final message in that chat. The hook hands off to main; main wakes the agent. The same shape replaces the warm slice workers in Shape B: one side chat agent takes on the orchestrator role and does all orchestrator work itself.
+Since 1.3.0 the worker is not a fresh subagent spawned per wake. It is a **side chat agent living in the poller's dedicated side chat** — that chat is its home, its brief lives there as a message (the chat brief is the source of truth; a file copy is a superseded fallback), and its exit report is its final message in that chat. The hook hands off to main; main wakes the agent. In Shape B the same shape is the orchestrator — but it does not do the work itself: the side chat agent is a pure router (wait, ack, route, interrupt, advance cursor — never thinks) and delegates all thinking to one warm reply worker subagent (see ADR-19). The B2 diagram below replaces the 1.3.0 claim that the orchestrator "does all orchestrator work itself".
 
 ```mermaid
 flowchart TB
@@ -85,13 +85,14 @@ flowchart TB
         M1 -->|"wake"| C1["Poller side chat<br/>agent lives here"]
         C1 -->|"polls queue at daemon rate<br/>acts, exits after 10 min quiet"| Q1
     end
-    subgraph B_SHAPE["Shape B, side-chat form — the side chat agent IS the orchestrator"]
+    subgraph B_SHAPE["Shape B2 — side-chat orchestrator + warm reply worker"]
         direction TB
         D2["Daemon (Shape A front end)"] --> Q2["queue.jsonl"]
         Q2 --> H2["Wake hook (60s)"]
         H2 -->|"handoff"| M2["Main chat"]
-        M2 -->|"wake"| C2["DM side chat<br/>agent = orchestrator"]
-        C2 -->|"classify, narrate, combat,<br/>scribe, voice — all itself"| Q2
+        M2 -->|"wake"| C2["Side chat<br/>agent = orchestrator<br/>(pure router)"]
+        C2 -->|"debounce, one interrupt<br/>per burst"| W2["Warm reply worker<br/>subagent, keep-alive wait<br/>thinks, replies, snapshots"]
+        W2 -->|"advance cursor"| Q2
     end
 ```
 
@@ -100,6 +101,8 @@ What it replaced: before 1.3.0 each wake spawned a fresh worker subagent that re
 ### Shape B — orchestrator
 
 No hook, no idle exit. A **router** polls the source, classifies each event by type, and dispatches it to exactly one slice-worker's queue. Each **slice worker** stays warm, owns exactly one slice of state (no other worker touches it), and hands tasks to siblings by appending to their queues — never by calling them directly. The session runs until the worker stop file is written.
+
+Shape B has a second variant, the **side-chat orchestrator + warm reply worker (B2)**: the side chat agent is a pure router (wait, ack, route, interrupt, advance cursor — never thinks) and delegates all thinking to one warm reply worker subagent, which stays alive on a blocking keep-alive wait and is interrupted per batch. The diagram below is the B1 router + slice-worker variant; the B2 variant is diagrammed in the side-chat-agent section above.
 
 ```mermaid
 flowchart TB
@@ -368,7 +371,7 @@ docs/
 
 ## Status
 
-Built 2026-11-13. Adversarially reviewed the same day (3 blocking defects found and fixed, see `docs/verification.md`). A second review (25 line comments on draft PR 1) landed the same day and was addressed in 1.0.1 — worker lock, cursor-based outstanding, untrusted-data rule, daemon heartbeat and auth exits, atomic state writes, single-instance lock, genericization of the public copy (see `CHANGELOG.md`). 1.1.0 turned the daemons into tested modules with source adapters and a config file, and added the lock and rotation scripts (see `CHANGELOG.md`). 1.2.0 added the watchdog and the resolve gate; 1.2.1 split the worker and daemon stop files. 1.3.0 (2026-11-14) brought the public skill copies up to the live pollers: native Muse skill format, the side-chat-agent worker shape, and the 1.1.0/1.2.1 sync, merged with the upstream flock/rotation discipline preserved (see `CHANGELOG.md`). Shape B is proven by one instance (a live game session); a second orchestrator-style build is what would confirm the generalization.
+Built 2026-11-13. Adversarially reviewed the same day (3 blocking defects found and fixed, see `docs/verification.md`). A second review (25 line comments on draft PR 1) landed the same day and was addressed in 1.0.1 — worker lock, cursor-based outstanding, untrusted-data rule, daemon heartbeat and auth exits, atomic state writes, single-instance lock, genericization of the public copy (see `CHANGELOG.md`). 1.1.0 turned the daemons into tested modules with source adapters and a config file, and added the lock and rotation scripts (see `CHANGELOG.md`). 1.2.0 added the watchdog and the resolve gate; 1.2.1 split the worker and daemon stop files. 1.3.0 (2026-11-14) brought the public skill copies up to the live pollers: native Muse skill format, the side-chat-agent worker shape, and the 1.1.0/1.2.1 sync, merged with the upstream flock/rotation discipline preserved (see `CHANGELOG.md`). 1.4.0 (2026-11-14) corrects Shape B: the side-chat orchestrator delegates thinking to a warm reply worker, with the reply-loop refinements (debounce, dynamic reply shape, ack-when-busy, jump-the-line) and the supporting mechanisms (snapshot, local-first reads, introspection, detached side effects) (see `CHANGELOG.md`). Shape B is proven by one instance per variant (a live game session); a second orchestrator-style build is what would confirm the generalization.
 
 ## License
 
