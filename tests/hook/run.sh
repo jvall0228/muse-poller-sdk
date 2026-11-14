@@ -13,6 +13,7 @@ cleanup() {
     for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && { pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; }; done
     # holders started by lock-holder.sh survive their parent: stop them
     pkill -f "$T/" 2>/dev/null
+    pkill -f '^sleep 317[0-9]$' 2>/dev/null   # processes the kill-sequence test detaches
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -648,6 +649,58 @@ run_hook
 lacks "wd example registry: patterns not rejected as unanchored" "$(reason)" "unanchored"
 lacks "wd example registry: patterns not rejected as invalid" "$(reason)" "invalid pgrep"
 check "brief does not instruct setsid" bash -c "! grep -E '^[^\`]*\bsetsid [a-z]' '$TPL/watchdog-worker-brief.md'"
+
+# one stopped and one down daemon: the wake reason names both, the payload
+# stays down-only
+new_wd_case wd_stopped_and_down
+jq -n --arg sf "$D/a-stop" '{daemons: [
+  {id: "a", pgrep: "^sleep 398$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: $sf, start: "x", verify: "x"},
+  {id: "b", pgrep: "^sleep 399$", heartbeat_file: null, heartbeat_field: "polled_at", stale_secs: 0, stop_file: "", start: "x", verify: "x"}]}' > "$D/registry.json"
+touch "$D/a-stop"
+run_hook
+eq "wd stopped + down: wake" "$(kind)" wake
+has "wd stopped + down: reason names the down daemon" "$(reason)" "down:  b"
+has "wd stopped + down: reason names the stopped daemon" "$(reason)" "intentionally stopped: a"
+eq "wd stopped + down: payload is down-only" "$(payload | jq -c '.down | keys')" '["b"]'
+
+# the worker brief's kill/restart sequence, run for real on throwaway
+# processes: detach-start, confirm with pgrep, SIGTERM (then SIGKILL for a
+# process that ignores it), confirm gone with pgrep, start a replacement,
+# confirm the replacement with pgrep
+detach() { # the brief's portable detach wrapper
+    python3 -c 'import os, sys; os.fork() and os._exit(0); os.setsid(); os.execvp("sh", ["sh", "-c", sys.argv[1]])' "$1"
+}
+wait_for() { # wait_for CMD... — up to ~5s
+    local i; for i in $(seq 1 50); do "$@" && return 0; sleep 0.1; done; return 1
+}
+gone() { ! pgrep -f "$1" >/dev/null; }
+KPAT='^sleep 3170$'
+detach "nohup sleep 3170 >/dev/null 2>&1 </dev/null &"
+wait_for pgrep -f "$KPAT" >/dev/null
+old=$(pgrep -f "$KPAT" | head -n 1)
+check "kill seq: detached process found by its anchored pattern" test -n "$old"
+eq "kill seq: detached into a new session" "$(python3 -c 'import os, sys; print(os.getsid(int(sys.argv[1])) != os.getsid(0))' "$old")" True
+check "kill seq: ps -o ppid=,args= works for the pid" bash -c "ps -o ppid=,args= -p $old | grep -q 'sleep 3170'"
+kill -TERM "$old"
+check "kill seq: SIGTERM, then pgrep confirms it is gone" wait_for gone "$KPAT"
+detach "nohup sleep 3170 >/dev/null 2>&1 </dev/null &"
+wait_for pgrep -f "$KPAT" >/dev/null
+new=$(pgrep -f "$KPAT" | head -n 1)
+check "kill seq: replacement is running" test -n "$new"
+check "kill seq: replacement is a new process" test "$new" != "$old"
+eq "kill seq: exactly one copy" "$(pgrep -f "$KPAT" | wc -l | tr -d ' ')" 1
+# a process that ignores SIGTERM needs the SIGKILL escalation
+kill -TERM "$new"; wait_for gone "$KPAT" || true
+KPAT2='^sleep 3171$'
+detach "nohup sh -c 'trap \"\" TERM; exec sleep 3171' >/dev/null 2>&1 </dev/null &"
+wait_for pgrep -f "$KPAT2" >/dev/null
+stuck=$(pgrep -f "$KPAT2" | head -n 1)
+kill -TERM "$stuck"; sleep 0.5
+check "kill seq: a TERM-ignoring process survives SIGTERM" pgrep -f "$KPAT2"
+kill -KILL "$stuck"
+check "kill seq: SIGKILL escalation, pgrep confirms gone" wait_for gone "$KPAT2"
+pkill -f '^sleep 317[0-9]$' 2>/dev/null
+check "kill seq: no test processes left" wait_for gone '^sleep 317[0-9]$'
 
 # the worker brief branches on the exact reasons the script emits
 BRIEF="$TPL/watchdog-worker-brief.md"
