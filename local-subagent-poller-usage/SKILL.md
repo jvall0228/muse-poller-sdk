@@ -24,6 +24,8 @@ Both shapes have the same pieces; what each is and how it works is defined in `d
 | Worker lock and alive file | `~/hooks/state/<poller>/worker.lock`, `worker-alive` |
 | Heartbeat and markers | `last-seen.json`, `error.json`, `channel-warning.json` in the state dir |
 | Stop file | `~/hooks/state/<poller>-stop` |
+| Watchdog | `~/hooks/scripts/daemon-watchdog.sh`, registered with `hooks.add` (60s poll); registry `~/hooks/state/daemon-registry.json` |
+| Activity side chat | One persistent side chat per poller; relayed handoffs land there, posted visibly |
 | High-water mark | `last-seen.json` (Shape A) or `last-dispatched-seq.txt` (Shape B) |
 
 ## Workflow — start a poller
@@ -41,14 +43,14 @@ Both shapes have the same pieces; what each is and how it works is defined in `d
 
 Run this whenever replies stop or before a session:
 
-1. **Daemon alive?** `ps` for the watcher process, `last-seen.json`'s `polled_at` fresh (threshold and why: design.md, "Daemon heartbeat and error markers"), and no `error.json`. A stale `polled_at` or an `error.json` means the queue is frozen, not quiet; judge by `polled_at`, never the file's mtime. A `channel-warning.json` means the daemon is running but one channel keeps failing: report it to the owner, do not restart for it. Recent log lines (`"level":"error"` / `"warn"`) say why.
+1. **Daemon alive?** `ps` for the watcher process, `last-seen.json`'s `polled_at` fresh (threshold and why: design.md, "Daemon heartbeat and error markers"), and no `error.json`. A stale `polled_at` or an `error.json` means the queue is frozen, not quiet; judge by `polled_at`, never the file's mtime. A `channel-warning.json` means the daemon is running but one channel keeps failing: report it to the owner, do not restart for it. Recent log lines (`"level":"error"` / `"warn"`) say why. If a watchdog hook is registered, check its last decision too — a daemon down with no recent wake means the watchdog itself needs attention (registry, hook state, or the hook's own log).
 2. **Cursor vs queue lines (Shape A).** The cursor equals the line count when the worker has caught up. If lines > cursor and no worker lock is held, a wake is due: check the hook's last decision (it stays silent for the startup window after a wake, and says "queue busy" while a rotation or append holds `queue.lock`). If the cursor lags with a worker alive, the worker is behind or dead. A cursor greater than the line count means the queue was just rotated and the cursor reset is not yet visible; the hook treats it as 0.
 3. **Worker lock held?** `lock-holder.sh status --lock <worker.lock> --alive <worker-alive>` prints one JSON line. A held lock means a worker is live. A stale alive file with the lock held means the worker stopped touching it (a stall or a dying worker), and the holder releases the lock on its own past the stale limit.
 
 ## Workflow — stop and resume
 
-- **Stop:** write the stop file. The daemon and all workers exit on their next loop check and report. For Shape A, also disable the hook — the hook does not check the stop file, so if items are queued when it is touched, it still wakes a worker that exits immediately (one wasted cold start).
-- **Resume:** delete the stop file. Shape A: re-enable the hook and restart the daemon the way it was started (start location rule: the SDK skill, "Operating rules"). The daemon resumes from `last-seen.json` — no re-baseline, no lost items. Shape B: re-spawn all workers with fresh briefs; the router starts from the high-water mark and will not re-dispatch old events, and slice workers resume from their `.cursor` files.
+- **Stop:** write the stop file. The daemon and all workers exit on their next loop check and report. For Shape A, also disable the hook — the hook does not check the stop file, so if items are queued when it is touched, it still wakes a worker that exits immediately (one wasted cold start). The watchdog DOES check the stop file, so it will not wake a worker for a stopped daemon — leave it enabled.
+- **Resume:** delete the stop file. Shape A: re-enable the hook and restart the daemon the way it was started (start location rule: the SDK skill, "Operating rules"). If a watchdog hook is registered and the daemon is dead, the watchdog restarts it on its next poll — or restart it yourself the way it was started. The daemon resumes from `last-seen.json` — no re-baseline, no lost items. Shape B: re-spawn all workers with fresh briefs; the router starts from the high-water mark and will not re-dispatch old events, and slice workers resume from their `.cursor` files.
 
 ## Operating rules
 
@@ -62,7 +64,8 @@ Run this whenever replies stop or before a session:
 
 - **A wake never lands (Shape A).** Check the cursor against the queue's line count and whether the worker lock is held (a failed spawn is retried after the startup window). If the hook baselined over a freshly created queue (its state has no `seen_absent` and no `baselined` flag), the item was swallowed — the fix is in the SDK skill (the seen_absent rule); as a workaround, append a new item to re-trigger a wake, and have the worker drain the backlog from its cursor.
 - **A worker stalls on a slow step** (e.g. a large upload). Split slow steps into their own worker with a retry cap, so one stall can't freeze the rest. Cover any unanswered items manually in the meantime.
-- **A dead daemon goes unnoticed.** The worker's liveness check is the only tripwire. On a stale `polled_at` or an `error.json`, restart the daemon and confirm the `baseline` event before trusting the queue again.
+- **A dead daemon goes unnoticed.** The watchdog hook is the tripwire: it wakes a worker to restart the daemon. The worker's liveness check is the backstop (it reports a dead daemon it cannot restart). On a stale `polled_at` or an `error.json`, restart the daemon and confirm the `baseline` event before trusting the queue again. If the watchdog is registered and the daemon stays down, check the watchdog's registry entry (pgrep pattern, heartbeat file) and its hook log — a bad pattern never wakes.
+- **The watchdog never wakes.** Check the registry file exists and parses, the daemon ids are unique, and the hook is registered and enabled. A missing or unreadable registry ends each poll silently with the reason in the hook log — there is nothing to supervise, so no worker spawns.
 - **Double-handling.** Exactly-once routing depends on the high-water mark advancing after dispatch. If the router dies mid-dispatch, a resume may re-route — workers must tolerate a duplicate task idempotently; check the cursor before re-acting.
 - **A worker exits but items remain.** The hook wakes a replacement on a later poll, once the startup window has passed (cursor-based outstanding — it does not wait for a new item). If no wake lands, spawn a worker manually from the brief so it drains the backlog.
 

@@ -32,6 +32,7 @@ All under `templates/`. Queue, cursor, worker lock, alive file, stop file, heart
 | **Router / slice worker briefs** (Shape B) | `router-brief.md`, `slice-worker-brief.md` | Fill placeholders; one slice-worker brief per slice. |
 | **Lock script** | `lock-holder.sh` (`take`, `release`, `status`) | Copy next to the briefs; the briefs call it through `{{SCRIPTS_DIR}}`. |
 | **Rotation script** | `rotate-queue.sh` | Same. Run by the worker once caught up; no-op unless the queue is large. |
+| **Daemon supervision** | `daemon-watchdog.sh`, `watchdog-worker-brief.md`, `daemon-registry.example.json` | Fill the registry (one entry per daemon) and the script placeholders; register the watchdog hook (60s poll) after the poller is built. One hook supervises all daemons. |
 
 ## The Source interface
 
@@ -77,6 +78,8 @@ Each brief and hook template defines its own `{{...}}` placeholders in its heade
 | `{{LOCK_STALE_SECS}}` | How stale the alive file may be before the lock holder exits by itself; default 900 (above the worst-case model turn) |
 | `{{STARTUP_WINDOW_SECS}}` | How long after a wake the hook stays silent while the worker starts and takes the lock, e.g. 300 |
 | `{{OWNER_ID}}` | The owner's verified author id in the source, never a display name |
+| `{{REGISTRY_PATH}}` | Absolute path to `daemon-registry.json`, the watchdog's registry (watchdog only) |
+| `{{RESOLVE_MODE}}` | How the worker's exit report resolves: `always` (report every run) or `on-unexpected` (default: report only ACTED / UNEXPECTED / FAILED; end ROUTINE runs silently) |
 
 The daemons have no placeholders. A filled-in template that still contains `{{` is unfinished.
 
@@ -87,8 +90,10 @@ The daemons have no placeholders. A filled-in template that still contains `{{` 
 3. **Copy** the daemon for your language, the example adapter, the example config, `lock-holder.sh`, `rotate-queue.sh`, `hook-watch.sh`, `hook-prompt.md` and `worker-brief.md` into the new poller's directory. **Write the adapter, edit the config, fill the hook and brief placeholders.** Do not edit the daemon.
 4. **Set the worker's poll interval to the daemon's** ("Worker poll matches your fastest producer").
 5. **Register the hook first, then start the daemon.** If the daemon queues items before the hook's first poll, the hook sees a file with lines and no `seen_absent`, and baselines over them (the first-canary shape). Register with `hooks.add` (prompt from `hook-prompt.md`, 60s poll) and dry-run every state before enabling (below).
-6. **Start the daemon, wait for its baseline, then post a canary.** Run `python3 daemon.py --config <config>` (or `bun daemon.ts --config <config>`) in the background with stderr appended to a log file, e.g. `nohup ... >> ~/hooks/logs/<name>-watcher.log 2>&1 &`. Use a supervisor or agent context as the first operating rule says. Confirm it is alive (`ps` plus the `baseline` log event). `bun daemon.ts --dry-run` runs one cycle and writes nothing. Only then post a canary; one posted before the first poll completes is baselined, not queued. Verify daemon queues it, hook wakes, worker acts, and record the post-to-reply latency.
-7. **Verify against the instances.** Every loop-logic line should trace to `references/instances.md` or to a reviewed change in `CHANGELOG.md` or `docs/decisions.md`. A line with neither is invented: delete it or prove it.
+6. **Register the watchdog hook.** One hook supervises all daemons: fill `daemon-registry.example.json` (one entry per daemon — pgrep pattern, heartbeat file, stale threshold, stop file, start command), fill `daemon-watchdog.sh` (`{{REGISTRY_PATH}}`, `{{WAKE_COOLDOWN_SECS}}`), and register it with `hooks.add` (60s poll, prompt from `watchdog-worker-brief.md`). Dry-run its states before enabling (below). It wakes a worker only when a daemon is down; it never restarts an intentionally stopped daemon.
+7. **Start the daemon, wait for its baseline, then post a canary.** Run `python3 daemon.py --config <config>` (or `bun daemon.ts --config <config>`) in the background with stderr appended to a log file, e.g. `nohup ... >> ~/hooks/logs/<name>-watcher.log 2>&1 &`. Use a supervisor or agent context as the first operating rule says. Confirm it is alive (`ps` plus the `baseline` log event). `bun daemon.ts --dry-run` runs one cycle and writes nothing. Only then post a canary; one posted before the first poll completes is baselined, not queued. Verify daemon queues it, hook wakes, worker acts, and record the post-to-reply latency.
+8. **Create the poller's activity side chat.** One persistent side chat per poller. Brief it to post relayed handoffs visibly and stay silent otherwise — it is the activity feed the owner reads, not a place for routine "still fine" notes.
+9. **Verify against the instances.** Every loop-logic line should trace to `references/instances.md` or to a reviewed change in `CHANGELOG.md` or `docs/decisions.md`. A line with neither is invented: delete it or prove it.
 
 **Hook dry-run states.** `hooks.dry_run` does not persist state (`set_state` is a no-op under `HATCH_HOOK_DRY_RUN=1`), so state 2 is unreachable on a fresh hook: seed `{"seen_absent": true}` into the hook's state file (`~/hooks/state/<hook-id>.json`) first, or test it live with `hooks.run`. State 5 needs a recent `woke_at` seeded. `tests/hook/run.sh` exercises all of them against a stub runtime.
 
@@ -104,6 +109,8 @@ The daemons have no placeholders. A filled-in template that still contains `{{` 
 | 7 | `queue.lock` held by a rotation or append | silent "queue busy" |
 | 8 | cursor greater than line count (rotated) | cursor treated as 0; wakes if lines exist and no worker is alive |
 
+The watchdog hook has its own seven dry-run states (listed in `daemon-watchdog.sh`'s header comment); `tests/hook/run.sh` exercises them against the same stub runtime.
+
 ## Workflow — Shape B (orchestrator)
 
 1. **Define the slices.** Each slice has exactly one owner and no other worker touches it. If two workers must touch the same state, the split is wrong.
@@ -116,7 +123,9 @@ The daemons have no placeholders. A filled-in template that still contains `{{` 
 
 Each rule's mechanism and motivating failure is in `docs/design.md`; the rule here is what you must build in.
 
-- **Start location.** A supervised service (systemd, launchd) is fine. Only where network credentials are scoped to an agent's tool call (for example an egress-proxy credential that rotates per call) must the daemon be started from agent context (a tool call, a cron, or a hook); recovery after the host is replaced then needs an agent-context mechanism such as a recovery cron.
+- **Start location.** A supervised service (systemd, launchd) is fine. Only where network credentials are scoped to an agent's tool call (for example an egress-proxy credential that rotates per call) must the daemon be started from agent context (a tool call, a cron, or a hook); recovery after the host is replaced then needs an agent-context mechanism such as a watchdog hook (one hook supervises all daemons; see "Daemon supervision" below).
+- **Daemon supervision.** One watchdog supervises all daemons. Register one watchdog hook (60s poll, prompt from `watchdog-worker-brief.md`) reading a daemon registry; it wakes a worker only when a daemon is down and its stop file is absent, and only once per cooldown per daemon. Never restart an intentionally stopped daemon; never start a second copy.
+- **Transparency is a decision at the resolve gate.** Every hook-spawned (Shape A) worker brief carries a RESOLVE instruction (`{{RESOLVE_MODE}}`: `always` or `on-unexpected`); the worker's exit report ends in a verdict line, and the poller hook's spawner resolves it — report ACTED / UNEXPECTED / FAILED, end ROUTINE runs silently. The watchdog worker resolves its own report the same way. Relayed handoffs go to the poller's activity side chat, which posts them visibly and stays silent otherwise.
 - **Worker poll matches your fastest producer.** Single-producer queue: match the daemon. Multi-producer queue: match the fastest producer.
 - **Hook baseline (seen_absent).** The hook records when it finds no queue file; it baselines only if the file pre-existed its first observation.
 - **Daemon baseline.** The daemon marks a channel baselined only when its first poll saw items. This is built into the daemons; an adapter must return unfiltered recent items when `since` is none.
@@ -150,5 +159,6 @@ When scaffolding a new poller, produce:
 - A hook from `hook-watch.sh` and a prompt from `hook-prompt.md`, registered with `hooks.add` and dry-run in every state in the table above before enabling.
 - `lock-holder.sh` and `rotate-queue.sh` copied next to the briefs, with `{{SCRIPTS_DIR}}` pointing at them.
 - A worker brief (Shape A), or a router brief plus one slice-worker brief per slice (Shape B), with no `{{` left.
+- A watchdog hook registered from `daemon-watchdog.sh` with a filled registry, and an activity side chat for the poller's relayed handoffs (briefed to post visibly, stay silent otherwise).
 - A canary test through the full path with the post-to-reply latency measured and recorded.
 - No skill manifest and no stray helper binaries or build artifacts.

@@ -96,6 +96,55 @@ template line is questioned, trace it here first.
   identifiers only — the production watcher and hook scripts predate those
   changes.
 
+## 4. Daemon watchdog — one hook supervises all (Nov 13)
+
+- **Scope:** two production daemons (team-queue watcher, chat-mentions
+  watcher). One hook (`daemon-watchdog`, 60s poll), script
+  `<hooks-dir>/daemon_watchdog.sh`, worker prompt in the hook definition.
+- **Checks per daemon:** process alive (anchored `pgrep`, both ends — the
+  exec tool's background-session wrapper is a bash whose `-c` argument
+  contains the same script path, so an unanchored pattern matches the
+  wrapper and reports a dead daemon as alive) AND heartbeat fresh. The
+  production check reads the `last-seen.json` file's mtime with a 120s
+  threshold; the template reads `polled_at` instead (the 1.1.0 rule: a
+  file's mtime is never a liveness signal — an idle daemon whose state
+  file only updates on new items looks dead).
+- **Stop files:** a daemon whose stop file exists is intentionally stopped
+  and skipped (`<state-dir>/team-queue-stop`,
+  `<state-dir>/chat-mentions-stop`). The production log once called a
+  stopped daemon "healthy"; the template logs it as intentionally
+  stopped.
+- **Cooldown:** 10 minutes per daemon after a wake, so a worker restarting
+  a daemon is not double-woken. The worker re-checks the stop file and
+  `pgrep` before starting.
+- **Measured:** proven twice the same day — a deliberate kill test, and a
+  real host replacement (~17:58) that killed both daemons silently; the
+  watchdog woke a worker that restarted both at 17:58:10.
+- **Template note:** `daemon-watchdog.sh` generalizes the production
+  script with a registry (no hard-coded daemon list), a `polled_at`
+  heartbeat check, a bad-pattern skip (an invalid regex or an
+  unanchored pattern is a config error, not a down daemon), and a
+  duplicate-id check. The production script's `printf '%(%s)T'`
+  timestamp is `date +%s` in the template.
+
+## Transparency probes (Nov 13)
+
+- **Probes 5 and 6 were never delivery failures.** The workers ran the
+  check and chose silence because "daemons stopped as intended" is the
+  expected state — there was nothing to report, and no handoff was ever
+  created. Routine silence is the correct default, not a bug.
+- **Probe 9:** the hook prompt named the resolve decision explicitly
+  ("the user is actively waiting on this probe result… call
+  `notify_main_agent`… do NOT call `nothing_to_do` for an expected
+  result here") and the handoff landed in main.
+- **Probe 10:** handoffs relayed via `chat.send_message` into one
+  persistent side chat per poller posted visibly, back-to-back.
+- **Probe 1b:** a post request buried inside a handoff was NOT followed
+  — the receiving agent stayed silent even with an explicit "post this"
+  in the worker's message. A direct `chat.send_message` instruction is
+  followed; a request inside a handoff is not. That is why the visible
+  post goes through a side chat, not through a handoff.
+
 ## Rate-limit numbers per source
 
 | Source | Poll | Load vs limit | Backoff | Notes |
