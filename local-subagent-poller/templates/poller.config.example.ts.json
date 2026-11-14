@@ -1,20 +1,47 @@
 {
-  "name": "example-source watcher",
-  "state_dir_name": "example-source",
-  "stop_file_name": "example-source-stop",
-  "poll_secs": 60,
-  "poll_jitter_secs": 5,
-  "backoff_steps_secs": [60, 120, 300],
-  "slow_call_secs": 10,
-  "call_timeout_secs": 60,
-  "max_failures": 5,
-  "channels": [
-    { "id": "team-queue", "name": "team-queue" }
-  ],
   "adapter": "./example-http-adapter.ts",
   "adapter_options": {
     "base_url": "https://api.example.invalid/v1",
-    "token_env": "EXAMPLE_SOURCE_TOKEN",
-    "self_id": "bot-user-id"
-  }
+    "self_id": "1498826002271572008",
+    "token_env": "EXAMPLE_SOURCE_TOKEN"
+  },
+  "backoff_steps_secs": [
+    30,
+    60,
+    300
+  ],
+  "call_timeout_secs": 10,
+  "channels": [
+    {
+      "id": "1095388571390705728",
+      "name": "general"
+    },
+    {
+      "id": "1095392320679071904",
+      "name": "pets"
+    },
+    {
+      "id": "1095392353969262652",
+      "name": "pics"
+    },
+    {
+      "id": "1166930453975019573",
+      "name": "letters"
+    },
+    {
+      "id": "1219351301704515604",
+      "name": "art"
+    },
+    {
+      "id": "1499021753391910942",
+      "name": "wisp"
+    }
+  ],
+  "max_failures": 5,
+  "name": "discord-mentions watcher",
+  "poll_jitter_secs": 2,
+  "poll_secs": 10,
+  "slow_call_secs": 5,
+  "state_dir_name": "discord-mentions",
+  "stop_file_name": "discord-mentions-stop"
 }

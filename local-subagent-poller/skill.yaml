@@ -1,0 +1,12 @@
+name: local-subagent-poller
+title: Subagent Poller SDK
+description: Build a poller that answers external events in seconds while idling at
+  zero tokens — a daemon + hook + worker (Shape A, intermittent work) or a router
+  + slice workers (Shape B, continuous sessions). Use when scaffolding a new
+  poller from the templates. For operating a poller that already exists (start,
+  health-check, stop/resume, stalls), use the operator skill
+  local-subagent-poller-usage instead.
+category: Work and knowledge
+include_in_prompt: false
+availability:
+  confidential_vm: true

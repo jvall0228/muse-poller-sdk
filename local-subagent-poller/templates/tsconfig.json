@@ -1,13 +1,17 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "allowImportingTsExtensions": true,
     "module": "esnext",
     "moduleResolution": "bundler",
-    "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "allowImportingTsExtensions": true,
-    "types": ["bun"]
+    "strict": true,
+    "target": "ES2022",
+    "types": [
+      "bun"
+    ]
   },
-  "include": ["*.ts", "../../tests/daemon/*.ts"]
+  "include": [
+    "*.ts"
+  ]
 }
