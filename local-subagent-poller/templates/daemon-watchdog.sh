@@ -67,7 +67,8 @@
 #     object) is normalised, never fatal.
 #   - If this script dies mid-run, nothing is lost: hook state is written
 #     before a wake (`.waking[<id>] = now`, `.wakes[<id>] += 1`) and, when a
-#     daemon is seen healthy, to clear its wake count, so a death before
+#     daemon is seen healthy, to clear its wake count and cooldown timestamp,
+#     so a death before
 #     the wake leaves the next poll free to retry, and a death after it
 #     only delays the next wake by the cooldown.
 #
@@ -307,10 +308,10 @@ while IFS= read -r entry; do
         age=$(heartbeat_age "$hb_file" "$hb_field")
         if [ "$age" = "absent" ]; then
             down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" '. + {($id): "process alive but no heartbeat file"}')
-        elif [ "$age" != "nofield" ] && [ "$stale" -gt 0 ] && [ "$age" -gt "$stale" ]; then
-            down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" --argjson a "$age" '. + {($id): ("heartbeat stale (" + ($a|tostring) + "s old)")}')
         elif [ "$age" = "unparseable" ]; then
             notes="${notes:+$notes; }unparseable $hb_field for $id"  # not healthy, not woken
+        elif [ "$age" != "nofield" ] && [ "$stale" -gt 0 ] && [ "$age" -gt "$stale" ]; then
+            down_json=$(printf '%s' "$down_json" | jq -c --arg id "$id" --argjson a "$age" '. + {($id): ("heartbeat stale (" + ($a|tostring) + "s old)")}')
         else
             healthy=$((healthy + 1))  # fresh heartbeat, or no polled_at yet (process-only)
             healthy_ids="$healthy_ids $id"
@@ -322,10 +323,12 @@ while IFS= read -r entry; do
 done < <(jq -c '.daemons[]' "$REGISTRY")
 
 # A daemon seen healthy (or intentionally stopped) starts its wake count
-# over. Persist only when something actually changes.
+# over and clears its cooldown timestamp, so a daemon that recovers then
+# dies again is woken promptly instead of waiting out the old cooldown.
+# Persist only when something actually changes.
 for id in $healthy_ids; do
-    if [ "$(printf '%s' "$state" | jq -r --arg d "$id" 'has("wakes") and (.wakes | has($d))')" = "true" ]; then
-        state=$(printf '%s' "$state" | jq -c --arg d "$id" 'del(.wakes[$d])')
+    if [ "$(printf '%s' "$state" | jq -r --arg d "$id" '(has("wakes") and (.wakes | has($d))) or (has("waking") and (.waking | has($d)))')" = "true" ]; then
+        state=$(printf '%s' "$state" | jq -c --arg d "$id" 'del(.wakes[$d], .waking[$d])')
         set_state "$state"
     fi
 done
@@ -384,4 +387,11 @@ set_state "$state"
 # would instruct this worker to restart it too.
 payload=$(printf '%s' "$down_json" | jq -c --arg wl "$wake_list" \
     '{down: (with_entries(select(.key as $k | ($wl | split(" ") | map(select(length > 0)) | index($k) != null))))}')
-wake "poller daemon(s) down: $wake_list${notes:+; $notes}" "$payload"
+# The reason also names the intentionally-stopped daemons (context the
+# worker/owner wants in the same line); the payload stays down-only, so a
+# stopped daemon is never restarted by this wake.
+stopped_reason=""
+if [ -n "${stopped_list// }" ]; then
+    stopped_reason="; intentionally stopped:${stopped_list}"
+fi
+wake "poller daemon(s) down: $wake_list${stopped_reason}${notes:+; $notes}" "$payload"
