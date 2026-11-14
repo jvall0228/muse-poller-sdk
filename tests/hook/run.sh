@@ -560,6 +560,53 @@ run_hook
 eq "wd future waking: wakes instead of permanent cooldown" "$(kind)" wake
 eq "wd future waking: timestamp rewritten to now" "$(state '.waking.fake <= (now + 5) and .waking.fake >= (now - 5)')" true
 
+# source outage: a live daemon with a stale heartbeat whose log shows recent
+# poll_failed lines is backing off, not hung — no wake. A silent log, or one
+# not ending in poll_failed, still wakes.
+new_wd_case wd_outage
+start_fake 310
+printf '{"polled_at":"2020-01-01T00:00:00Z"}' > "$D/last-seen.json"
+mkreg "$FAKE_PAT" "$D/last-seen.json" 30 ""
+jq --arg lf "$D/daemon.log" '.daemons[0].log_file = $lf' "$D/registry.json" > "$D/r2" && mv "$D/r2" "$D/registry.json"
+iso_ago() { jq -nr "now - $1 | floor | todateiso8601"; }
+printf '{"ts":"%s","level":"warn","event":"poll_failed","attempt":3,"max_failures":5,"backoff_secs":60}\n' "$(iso_ago 20)" > "$D/daemon.log"
+run_hook
+eq "wd backing off: silent, no wake" "$(kind)" silent
+has "wd backing off: reason says so" "$(reason)" "backing off"
+has "wd backing off: names daemon and attempt" "$(reason)" "fake(attempt 3)"
+lacks "wd backing off: not a restart case" "$(reason)" "all daemons healthy"
+check "wd backing off: no wake state written" test ! -s "$D/state.json"
+# Python-style timestamp (+00:00, no fraction) works too
+printf '{"ts":"%s","level":"warn","event":"poll_failed","attempt":1,"backoff_secs":60}\n' "$(iso_ago 20 | sed 's/Z$/+00:00/')" > "$D/daemon.log"
+run_hook
+eq "wd backing off: +00:00 timestamp silent" "$(kind)" silent
+# log silent for longer than backoff_secs + stale_secs: hung, wake
+printf '{"ts":"%s","level":"warn","event":"poll_failed","attempt":3,"backoff_secs":60}\n' "$(iso_ago 500)" > "$D/daemon.log"
+run_hook
+eq "wd outage log silent too long: wake" "$(kind)" wake
+has "wd outage log silent too long: stale" "$(payload | jq -r .down.fake)" "heartbeat stale"
+# last line is not poll_failed: wake
+printf '{"ts":"%s","event":"poll_failed","attempt":3,"backoff_secs":60}\n{"ts":"%s","event":"poll_slow"}\n' "$(iso_ago 20)" "$(iso_ago 5)" > "$D/daemon.log"
+rm -f "$D/state.json"
+run_hook
+eq "wd log ends in other event: wake" "$(kind)" wake
+# garbage / missing log: wake
+echo 'not json' > "$D/daemon.log"
+rm -f "$D/state.json"
+run_hook
+eq "wd garbage log: wake" "$(kind)" wake
+rm -f "$D/daemon.log"
+rm -f "$D/state.json"
+run_hook
+eq "wd missing log: wake" "$(kind)" wake
+# no heartbeat file yet (never polled OK) but failing and backing off
+rm -f "$D/last-seen.json"
+printf '{"ts":"%s","event":"poll_failed","attempt":1,"backoff_secs":60}\n' "$(iso_ago 5)" > "$D/daemon.log"
+run_hook
+eq "wd no heartbeat file but backing off: silent" "$(kind)" silent
+has "wd no heartbeat file but backing off: reason" "$(reason)" "backing off"
+stop_fake
+
 # alternation: an unparenthesised | leaves one branch unanchored
 new_wd_case wd_alt
 mkreg '^nope|sleep 777$' "" 0 ""
@@ -579,6 +626,10 @@ for r in "process missing" "heartbeat stale" "process alive but no heartbeat fil
     check "brief names reason '$r'" grep -qF "$r" "$BRIEF"
 done
 check "brief covers error.json" grep -q "error.json" "$BRIEF"
+check "brief tells the worker to read log_file" grep -qF "log_file" "$BRIEF"
+check "brief names the poll_failed discriminator" grep -qF "poll_failed" "$BRIEF"
+check "brief says never kill a backing-off daemon" grep -qiF "Never kill a daemon that is backing off" "$BRIEF"
+check "registry example gives every daemon a log_file" jq -e '.daemons | all(has("log_file"))' "$TPL/daemon-registry.example.json"
 
 echo "== lock-holder.sh =="
 LH="$TPL/lock-holder.sh"
