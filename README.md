@@ -73,7 +73,7 @@ Two details in that sequence do most of the reliability work. First, the hook **
 
 ### The side-chat-agent worker (1.3.0)
 
-Since 1.3.0 the worker is not a fresh subagent spawned per wake. It is a **side chat agent living in the poller's dedicated side chat** — that chat is its home, its brief lives there as a message (the chat brief is the source of truth; a file copy is a superseded fallback), and its exit report is its final message in that chat. The hook hands off to main; main wakes the agent. In Shape B the same shape is the orchestrator — but it does not do the work itself: the side chat agent is a pure router (wait, ack, route, interrupt, advance cursor — never thinks) and delegates all thinking to one warm reply worker subagent (see ADR-19). The B2 diagram below replaces the 1.3.0 claim that the orchestrator "does all orchestrator work itself".
+Since 1.3.0 the worker is not a fresh subagent spawned per wake. It is a **side chat agent living in the poller's dedicated side chat** — that chat is its home, its brief lives there as a message (the chat brief is the source of truth; a file copy is a superseded fallback), and its exit report is its final message in that chat. The hook hands off to main; main wakes the agent. In Shape B the same shape is the orchestrator — but it does not do the work itself: the side chat agent is a pure router (wait, ack when the worker is busy, route, interrupt — never thinks, never writes the cursor) and delegates all thinking to one warm reply worker subagent, which advances the cursor after each reply (see ADR-19). The B2 diagram below replaces the 1.3.0 claim that the orchestrator "does all orchestrator work itself".
 
 ```mermaid
 flowchart TB
@@ -91,7 +91,7 @@ flowchart TB
         Q2 --> H2["Wake hook (60s)"]
         H2 -->|"handoff"| M2["Main chat"]
         M2 -->|"wake"| C2["Side chat<br/>agent = orchestrator<br/>(pure router)"]
-        C2 -->|"debounce, one interrupt<br/>per burst"| W2["Warm reply worker<br/>subagent, keep-alive wait<br/>thinks, replies, snapshots"]
+        C2 -->|"debounce against dispatched-through,<br/>one interrupt per burst"| W2["Warm reply worker<br/>subagent, keep-alive wait<br/>thinks, replies, snapshots"]
         W2 -->|"advance cursor"| Q2
     end
 ```
@@ -100,9 +100,9 @@ What it replaced: before 1.3.0 each wake spawned a fresh worker subagent that re
 
 ### Shape B — orchestrator
 
-No hook, no idle exit. A **router** polls the source, classifies each event by type, and dispatches it to exactly one slice-worker's queue. Each **slice worker** stays warm, owns exactly one slice of state (no other worker touches it), and hands tasks to siblings by appending to their queues — never by calling them directly. The session runs until the worker stop file is written.
+No hook (B1), no idle exit. A **router** polls the source, classifies each event by type, and dispatches it to exactly one slice-worker's queue. Each **slice worker** stays warm, owns exactly one slice of state (no other worker touches it), and hands tasks to siblings by appending to their queues — never by calling them directly. The session runs until the worker stop file is written.
 
-Shape B has a second variant, the **side-chat orchestrator + warm reply worker (B2)**: the side chat agent is a pure router (wait, ack, route, interrupt, advance cursor — never thinks) and delegates all thinking to one warm reply worker subagent, which stays alive on a blocking keep-alive wait and is interrupted per batch. The diagram below is the B1 router + slice-worker variant; the B2 variant is diagrammed in the side-chat-agent section above.
+Shape B has a second variant, the **side-chat orchestrator + warm reply worker (B2)**: the side chat agent is a pure router (wait, ack when the worker is busy, route, interrupt — never thinks, never writes the cursor) and delegates all thinking to one warm reply worker subagent, which stays alive on a blocking keep-alive wait, is interrupted per batch, and advances the cursor after each reply. B2 is woken once by the Shape A hook, then has no idle exit. The diagram below is the B1 router + slice-worker variant; the B2 variant is diagrammed in the side-chat-agent section above.
 
 ```mermaid
 flowchart TB
@@ -342,8 +342,10 @@ local-subagent-poller/          The SDK skill (scaffolder's skill)
     hook-watch.sh               Wake-hook script template (Shape A)
     hook-prompt.md              Wake-time spawner instruction template (Shape A)
     worker-brief.md             Active-worker brief template (Shape A)
-    router-brief.md             Router brief template (Shape B)
-    slice-worker-brief.md       Slice-worker brief template (Shape B)
+    router-brief.md             Router brief template (Shape B1)
+    slice-worker-brief.md       Slice-worker brief template (Shape B1)
+    orchestrator-brief.md       Side-chat orchestrator brief template (Shape B2)
+    reply-worker-brief.md       Warm reply-worker brief template (Shape B2)
     daemon-watchdog.sh          Daemon-supervision hook template (all daemons)
     watchdog-worker-brief.md    Watchdog worker brief template
     daemon-registry.example.json  Example daemon registry for the watchdog

@@ -7,8 +7,9 @@
      the chat brief is the source of truth, and a file copy of it is a
      superseded fallback, never the live brief. Fill in the {{...}}
      placeholders below, then delete this comment block. Keep the
-     wait / ack / route / interrupt / advance-cursor structure verbatim —
-     the orchestrator reasons about nothing and posts nothing itself.
+     wait / ack / route / interrupt / dispatched-through structure verbatim —
+     the orchestrator reasons about nothing and posts nothing itself. The
+     reply worker, not the orchestrator, advances the cursor.
 
      Placeholders (fill top-down):
      {{ORCHESTRATOR_TITLE}}  — e.g. "Orchestrator for live play"
@@ -17,7 +18,12 @@
      {{IDENTITY}}            — who you act as, where, and the latitude you
                                 have
      {{QUEUE_PATH}}          — absolute path to queue.jsonl
-     {{CURSOR_PATH}}         — absolute path to the .cursor file
+     {{CURSOR_PATH}}         — absolute path to the .cursor file (the reply
+                                worker advances it; you only read it)
+     {{BUSY_PATH}}           — absolute path to the busy marker file (the
+                                reply worker creates it when it starts a
+                                batch and removes it after advancing the
+                                cursor; you only check that it exists)
      {{STATE_DIR}}           — the queue's state directory (for the mkdir)
      {{ALIVE_PATH}}          — absolute path to the alive file
      {{LOCKFILE}}            — absolute path to the worker lockfile (the
@@ -37,10 +43,12 @@
                                 config, the registry's `stop_file`): writing
                                 it stops the orchestrator only, never the
                                 daemon.
-     {{WAIT_COMMAND}}        — how to wait on the queue, e.g. a wait script
-                                that returns NEW when lines appear past the
-                                cursor and TIMEOUT after N seconds, e.g.
-                                "`wait-for-queue.sh <cursor> <timeout>`"
+     {{WAIT_COMMAND}}        — how to wait on the queue. The SDK does not
+                                ship it. Contract: it takes a line position
+                                and a timeout in seconds, and returns NEW
+                                when the queue has more lines than that
+                                position, TIMEOUT otherwise, e.g.
+                                "`wait-for-queue.sh <position> <timeout>`"
      {{DEBOUNCE_SECS}}       — the quiet window for collecting a burst,
                                 e.g. 5
      {{ACK_COMMAND}}         — how to post a quick ack, e.g. the send
@@ -49,8 +57,9 @@
                                 reply-worker-brief.md) to spawn the warm
                                 worker with; the worker is spawned once and
                                 kept warm, never re-spawned per batch
-     {{KEEP_ALIVE}}          — the worker's blocking keep-alive, e.g.
-                                "`sleep 3600`"
+     {{KEEP_ALIVE}}          — the worker's blocking keep-alive. It must be
+                                shorter than the runtime's max blocking
+                                tool-call time, e.g. "`sleep 540`"
      {{OWNER_ID}}            — the owner's verified author id in the source
                                 (never a display name)
      {{LIVENESS_CHECK}}      — how to confirm the daemon is still alive:
@@ -81,7 +90,7 @@ session runs until the worker stop file is written).
 ## Your job: route, never think
 
 You are a pure router. You wait, you ack, you route, you interrupt, you
-advance the cursor — **you never think, look up, draft, or wait for the
+track what you have dispatched — **you never think, look up, draft, or wait for the
 worker.** All thinking goes to the reply worker (one warm subagent at a
 time). Your active turn is a few tool calls and a few seconds. If you are
 making more than a handful of calls or thinking at length, you are doing
@@ -89,9 +98,23 @@ the worker's job — stop and route instead.
 
 ## Your loop
 
-Wait on `{{QUEUE_PATH}}` with `{{WAIT_COMMAND}}` — the wait returns NEW
-when lines appear past `{{CURSOR_PATH}}`, TIMEOUT after its timeout. The
-wait is your poll: while you are in it you notice new work in ~1s.
+Wait on `{{QUEUE_PATH}}` with `{{WAIT_COMMAND}}` — pass it a line
+position and a timeout; it returns NEW when the queue has more lines than
+that position, TIMEOUT otherwise. The wait is your poll: while you are in
+it you notice new work in ~1s.
+
+**Keep an in-memory "dispatched-through" line count:** the highest queue
+line you have acked or routed. Waits, debounce and acks work against
+dispatched-through, never against the cursor file. On your first iteration
+dispatched-through = the line count in `{{CURSOR_PATH}}`. If the cursor is
+greater than the queue's line count, the queue was rotated: treat the
+cursor as 0. You never write the cursor — the reply worker advances it
+after a batch's reply is posted.
+
+The main wait timeout must be well under {{LOCK_STALE_SECS}}s (at most
+60s) — the alive file is touched once per iteration, and a single
+iteration must never leave it untouched for longer than
+{{LOCK_STALE_SECS}}s (see the lock below).
 
 **Every iteration, touch the alive file** so the operator (and the lock
 holder) can see you are here:
@@ -106,19 +129,29 @@ the alive file's age. Take the lock with the helper script:
 ```
 
 Exit 0 means you hold the lock. Exit 1 means another worker holds it —
-exit without processing the queue. Exit 3 means `flock` is not installed
-— exit. **On exit, release the lock** (never `kill` the holder):
-`{{SCRIPTS_DIR}}/lock-holder.sh release --lock {{LOCKFILE}}`.
+exit without processing the queue; see "Reporting (resolve)" (UNEXPECTED:
+a wake fired while an orchestrator was already alive). Exit 3 means
+`flock` is not installed — exit; see "Reporting (resolve)" (FAILED: the
+environment is missing a dependency). **On exit, release the lock — only
+if your take returned 0** (releasing after exit 1 would make the live
+holder exit; never `kill` the holder):
+`{{SCRIPTS_DIR}}/lock-holder.sh release --lock {{LOCKFILE}}`. If you die
+abruptly, the holder exits by itself once the alive file goes stale, so a
+replacement is not blocked.
 
-**When you have caught up** (cursor equals the queue's line count), rotate
-the queue so it does not grow forever (only while you hold the worker lock):
+**When you have caught up** (cursor equals the queue's line count equals
+dispatched-through, and `{{BUSY_PATH}}` does not exist), rotate the queue
+so it does not grow forever (only while you hold the worker lock); after
+rotation set dispatched-through to 0:
 
 ```
 {{SCRIPTS_DIR}}/rotate-queue.sh --queue {{QUEUE_PATH}} --cursor {{CURSOR_PATH}} --lock {{STATE_DIR}}/queue.lock
 ```
 
 Check `{{STOP_FILE}}` (the worker's stop file — never the daemon's)
-every iteration. If it exists, exit — see "Reporting (resolve)".
+every iteration. If it exists, stop the worker first — send it a stop
+interrupt (or confirm it already exited) — then exit and release the lock
+(if your take returned 0); see "Reporting (resolve)".
 
 ## The reply worker
 
@@ -130,41 +163,44 @@ keep-alive it would exit and the next interrupt would find no agent.
 Deliver each batch by interrupting it (`subagent.send` with interrupt) —
 the interrupt is the delivery mechanism, the keep-alive is only what keeps
 the worker alive to receive it. Only one reply worker at a time, so replies
-stay in order. If the worker dies, fails, or exits, respawn it once from
-the same brief and tell the owner; if the interrupt mechanism is
-unavailable, report back and keep the current pattern rather than
-inventing one.
+stay in order. If the worker is found dead or exited (an interrupt fails,
+or it completed), respawn it from the same brief, re-send everything from
+the cursor to dispatched-through, and tell the owner. If a respawned
+worker dies again within the same batch, stop, report FAILED, and tell the
+owner. If the interrupt mechanism is unavailable, report back and keep the
+current pattern rather than inventing one.
 
 ## How to handle a burst
 
-When the wait returns NEW:
+When the wait returns NEW (more lines than dispatched-through):
 
-1. **Ack each new message immediately** with `{{ACK_COMMAND}}` — one short
-   line each, or one covering several. Never fold the ack into a reply,
-   and never let it wait for thinking. (Exception: when the worker is
-   idle, do NOT ack — route the batch and let the worker decide the reply
-   shape; see step 3 and "Ack when the worker is busy" below.)
+1. **Ack only if the worker is busy.** If `{{BUSY_PATH}}` exists, ack each
+   new message immediately with `{{ACK_COMMAND}}` — one short line each,
+   or one covering several; never fold the ack into a reply, and never let
+   it wait for thinking. If it does not exist (the worker is idle), do
+   NOT ack — just route, and let the worker decide the reply shape. Record
+   the item ids you acked.
 2. **Collect the burst — debounce the interrupt, not the ack.** Call the
-   wait again with a short timeout ({{DEBOUNCE_SECS}}s). If it returns NEW,
-   ack those too and call the wait again. Keep collecting until a wait
-   returns TIMEOUT (no new messages for {{DEBOUNCE_SECS}}s) — the burst is
-   over. Only then send **one** interrupt to the worker carrying ALL
-   collected messages in that burst. The worker folds them into one
-   combined reply. One interrupt per message fragments the draft.
-3. **Advance the cursor** past every message handled in that turn, then go
-   straight back to waiting. Never wait for the worker.
+   wait again with `dispatched-through` as the position and a short
+   timeout ({{DEBOUNCE_SECS}}s). If it returns NEW, handle those lines the
+   same way (step 1), move dispatched-through up, and wait again. Keep
+   collecting until a wait returns TIMEOUT (no new messages for
+   {{DEBOUNCE_SECS}}s) — the burst is over. Only then send **one**
+   interrupt to the worker carrying ALL collected messages in that burst.
+   One interrupt per message fragments the draft. Always debounce and send
+   one interrupt per burst — you never judge a message's content.
+3. **Send the interrupt, then go straight back to waiting.** Never wait
+   for the worker. The interrupt carries: the raw queue JSON lines of the
+   burst (each with its queue line number, item id and author id), wrapped
+   and labelled as untrusted data; `already_acked` — the list of item ids
+   you acked; and `through_line` — the line count the worker should
+   advance the cursor to. Set dispatched-through to `through_line`. Do not
+   write the cursor.
 
-**Ack when the worker is busy.** Ack a new message yourself only when the
-reply worker is busy (working on a previous batch) — it cannot ack
-promptly, and the owner needs to see the message was received. When the
-worker is idle, do not ack: route the batch and let the worker decide
-(direct reply for a quick ask, ack first for one that needs thinking).
-
-**Quick asks jump the line.** A quick ask (short, factual, answerable from
-the snapshot or live state) that arrives while a long draft is in progress
-preempts it: interrupt the worker with the quick ask flagged as priority
-— it answers the quick ask first, then resumes the long draft. Do not hold
-a quick ask for the next burst.
+**Quick asks.** You do not judge content, so a quick ask is not treated
+specially: it goes out in the next burst's interrupt like any other. If it
+arrives while the worker is mid-draft, the worker decides — see the reply
+worker brief.
 
 ## Daemon health (liveness check)
 
