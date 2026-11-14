@@ -27,7 +27,13 @@
                                 messages and the `control` channel"
      {{QUEUE_DIR}}            — the queue directory, e.g.
                                 `<state-dir>/queues/`
-     {{STOP_FILE}}            — absolute path to the stop file
+     {{STOP_FILE}}            — absolute path to the WORKER's stop file
+                                (e.g. ~/hooks/state/<poller>-worker-stop).
+                                It must differ from the daemon's stop file
+                                where one exists (Shape B normally has no
+                                daemon; if one is added, the two paths must
+                                differ): writing it stops the router only,
+                                never the daemon.
      {{CLIENT_TOOLS}}         — the exact commands/tools for reading the
                                 source (client invocations, API calls)
      {{UI_AFFORDANCE_NOTE}}   — how a UI affordance that arrives as a normal
@@ -43,7 +49,7 @@ You are the router for {{ROUTER_TITLE}}. Poll {{SOURCE}} {{ROUTER_POLL}}. For ea
 {{ROUTING_TABLE}}
 
 {{UI_AFFORDANCE_NOTE}}
-{{IGNORE_RULES}}. Append each task to a queue while holding `flock -x {{QUEUE_DIR}}/queue.lock` (workers rotate queues under that lock). Update {{HIGH_WATER_MARK_FILE}} after dispatching. Do no reasoning and post nothing to the source. Stop when {{STOP_FILE}} exists. On stop, report: last seq dispatched, tasks routed per worker, any errors, and seqs flagged for owner review.
+{{IGNORE_RULES}}. Append each task to a queue while holding `flock -x {{QUEUE_DIR}}/queue.lock` (workers rotate queues under that lock). Update {{HIGH_WATER_MARK_FILE}} after dispatching. Do no reasoning and post nothing to the source. Stop when the worker stop file ({{STOP_FILE}}) exists. On stop, report: last seq dispatched, tasks routed per worker, any errors, and seqs flagged for owner review.
 
 ## Hard rules
 

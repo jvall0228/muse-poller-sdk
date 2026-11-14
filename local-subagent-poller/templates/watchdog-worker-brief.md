@@ -147,7 +147,7 @@ The verdict line is the last line of your report, exactly one of:
   forever. (The hook also stops waking you for a daemon after a few
   consecutive wakes without recovery; a FAILED report is how the owner
   hears about it.)
-- UNEXPECTED: the hook woke you for a daemon whose stop file exists
+- UNEXPECTED: the hook woke you for a daemon whose daemon stop file exists
   (a hook/registry mismatch), or a process is running but its heartbeat
   is still stale or missing and you could not act on it.
 - ROUTINE: process running AND `polled_at` fresh when you checked (a
@@ -158,8 +158,12 @@ The verdict line is the last line of your report, exactly one of:
 
 ## Hard rules
 
-- **Never restart an intentionally stopped daemon.** The stop file is the
-  owner's word; the hook should have skipped it.
+- **Never restart an intentionally stopped daemon.** The daemon stop file is the
+  owner's word; the hook should have skipped it. The registry's
+  `stop_file` is the DAEMON's stop file only — a worker stop file
+  (e.g. `<poller>-worker-stop`) existing does not mean the daemon is
+  intentionally stopped, and the watchdog hook only reads the registry's
+  `stop_file`, so never treat a worker-stop file as a daemon-stop.
 - **Never kill a daemon that is backing off.** A recent `poll_failed` in
   its `log_file` means alive and waiting out a source outage; report it,
   do not restart it.
