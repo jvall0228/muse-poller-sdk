@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.4.0 — 2026-11-14
+
+The Shape B orchestrator is corrected to what it was always meant to be — a pure router that delegates thinking to a warm reply worker — plus the reply-loop refinements measured on a live session the same day. Docs, skill, and templates only; no daemon, hook, or watchdog code changed.
+
+### Added
+
+- **ADR-18 lands in the top-level `docs/decisions.md`.** The side-chat-agent pattern (the Shape A worker is a side chat agent; the hook hands off to main) existed only in the skill's copy — the known doc gap is closed. The top-level copy genericizes the instance names per ADR-7; ADR-19/20/21 are identical in both files.
+- **ADR-19: the Shape B orchestrator delegates thinking to a warm reply worker.** The side chat agent is a pure router (wait, ack when the worker is busy, route, interrupt — never thinks, never writes the cursor); the worker advances the cursor; all thinking goes to one warm reply worker subagent at a time. A subagent completes when idle, so the worker stays alive on a blocking keep-alive wait and is interrupted per batch (`subagent.send` with interrupt). The orchestrator's active turn is a few tool calls and a few seconds.
+- **ADR-20: the reply loop settles, then the worker owns the shape.** Debounce (one interrupt per burst after a ~5s quiet window, against the orchestrator's in-memory dispatched-through position), dynamic reply shape (worker decides direct reply vs ack-then-think per batch), ack-when-busy (orchestrator acks only when the worker's busy marker exists), jump-the-line (the worker decides; a quick ask mid-draft is answered first).
+- **ADR-21: state, diagnostics, and side effects around the reply loop.** Context snapshot (worker writes state after each reply, reads it first next time), local-first reads (fastest local copy, remote only when missing or known stale), worker introspection (per-step timing log + one-line summary appended to the timings log), detached side effects (fire-and-forget after the reply is posted), and the long-poll source (daemon uses a server-side wait when the source offers one; wait timeout < call timeout < client bound; loop = call-wait-re-call, no sleep).
+- **New templates: `orchestrator-brief.md` and `reply-worker-brief.md`.** The Shape B2 briefs — the side-chat orchestrator (pure router) and the warm reply worker (keep-alive, snapshot-first, local-first lookups, dynamic reply shape, detached side effects, timing log). Added to the skill's pieces table and the Shape B2 workflow.
+- **Measured warm-reply latencies.** Reply-posted times from the live session: ~2s for a no-lookup reaction, ~11s for a quick ask, ~36s for a lookup-heavy batch; local-first reads cut a notes-heavy batch from 57.9s to 40.2s.
+
+### Changed
+
+- **Shape B is two variants (B1 router + slice workers, B2 side-chat orchestrator + warm reply worker).** The skill's Shape B description, Shape B workflow, operating rules, and output contract now cover both. The README's side-chat-agent section and its Shape B diagram are corrected: the orchestrator no longer "does all orchestrator work itself" — it routes, and the reply worker thinks.
+- **Safety fixes in the B2 design.** Worker-owned cursor (a dead worker's batch is re-sent, not lost); debounce against an in-memory dispatched-through position, with the `{{WAIT_COMMAND}}` contract documented; busy marker (`{{BUSY_PATH}}`) for ack-when-busy; the worker stop file stops the reply worker; keep-alive shorter than the runtime's blocking-call limit with re-entry and an orchestrator respawn rule; lock released only by its holder; atomic snapshot and cursor writes.
+- **The live-session instance in the skill is updated.** The Varisia chain is live as a Shape A daemon + hook + side-chat orchestrator (B2) + warm reply worker, with the measured latencies above.
+
+### Deliberately excluded
+
+- **The Narrator / Combat / Scribe slice-worker split** (pattern-changes item 10) is proposed, not decided — it is not in this release.
+
 ## 1.3.0 — 2026-11-14
 
 The public skill copies catch up with the live pollers: native Muse skill format, the side-chat-agent worker shape (ADR-18), and the 1.1.0/1.2.1 work that had only lived locally — merged with the upstream flock/rotation discipline preserved, not overwritten.

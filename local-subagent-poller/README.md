@@ -64,8 +64,10 @@ local-subagent-poller/          The SDK skill (scaffolder's skill)
     hook-watch.sh               Wake-hook script template (Shape A)
     hook-prompt.md              Wake-time spawner instruction template (Shape A)
     worker-brief.md             Active-worker brief template (Shape A)
-    router-brief.md             Router brief template (Shape B)
-    slice-worker-brief.md       Slice-worker brief template (Shape B)
+    router-brief.md             Router brief template (Shape B1)
+    slice-worker-brief.md       Slice-worker brief template (Shape B1)
+    orchestrator-brief.md       Side-chat orchestrator brief template (Shape B2)
+    reply-worker-brief.md       Warm reply-worker brief template (Shape B2)
     daemon-watchdog.sh          Daemon-supervision hook script (one hook, all daemons)
     watchdog-worker-brief.md    Watchdog worker brief
     daemon-registry.example.json  Watchdog registry example
