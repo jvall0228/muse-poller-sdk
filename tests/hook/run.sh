@@ -536,6 +536,30 @@ echo "{\"waking\":{\"fake\":$NOW},\"wakes\":{\"fake\":2}}" > "$D/state.json"
 run_hook
 eq "wd stopped: wake keys cleared immediately" "$(state '(.wakes | has("fake")) or (.waking | has("fake"))')" false
 
+# .waking / .wakes values that are not plain integers must not wedge the daemon
+new_wd_case wd_coerce
+mkreg "^sleep 399$" "" 0 ""
+for v in "$((NOW - 100000)).5" '1e3' '-5'; do
+    echo "{\"waking\":{\"fake\":$v}}" > "$D/state.json"
+    run_hook
+    eq "wd waking $v: wakes (no arithmetic error, no stuck cooldown)" "$(kind)" wake
+done
+echo '{"waking":{"fake":1e300}}' > "$D/state.json"
+run_hook
+eq "wd waking 1e300: wakes" "$(kind)" wake
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":1.5}}" > "$D/state.json"
+run_hook
+eq "wd fractional wakes: wakes" "$(kind)" wake
+eq "wd fractional wakes: floored then incremented" "$(state .wakes.fake)" 2
+echo "{\"waking\":{\"fake\":$((NOW - 100000))},\"wakes\":{\"fake\":1e300}}" > "$D/state.json"
+run_hook
+has "wd huge wakes: clamped, gives up" "$(reason)" "gave up waking for fake"
+# a .waking timestamp in the future (clock stepped back) is treated as never woken
+echo "{\"waking\":{\"fake\":$((NOW + 100000))}}" > "$D/state.json"
+run_hook
+eq "wd future waking: wakes instead of permanent cooldown" "$(kind)" wake
+eq "wd future waking: timestamp rewritten to now" "$(state '.waking.fake <= (now + 5) and .waking.fake >= (now - 5)')" true
+
 # alternation: an unparenthesised | leaves one branch unanchored
 new_wd_case wd_alt
 mkreg '^nope|sleep 777$' "" 0 ""

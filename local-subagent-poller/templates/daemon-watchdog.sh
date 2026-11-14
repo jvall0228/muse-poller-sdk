@@ -349,6 +349,16 @@ while IFS= read -r entry; do
     fi
 done < <(jq -c '.daemons[]' "$REGISTRY")
 
+# last_wake_of <id>: the daemon's last wake time as a plain integer. A
+# non-number, a fractional or exponent value (jq would print 1E+3), or a
+# timestamp in the future (the clock stepped back) must not break the
+# arithmetic or pin the daemon in cooldown forever: non-numbers and future
+# values read as 0 (never woken), fractions are floored.
+last_wake_of() {
+    printf '%s' "$state" | jq -r --arg d "$1" --argjson now "$now" \
+        '(.waking[$d] // 0) | if type == "number" and . <= $now then (floor | if . < 0 then 0 else . end) else 0 end'
+}
+
 # Resetting a daemon's wake count and cooldown. An intentionally stopped
 # daemon is reset at once (the owner stopped it; creating then removing the
 # stop file re-arms it). A daemon seen healthy is reset only after it has
@@ -366,7 +376,7 @@ for id in $stopped_ids; do
     clear_wake_state "$id"
 done
 for id in $healthy_ids; do
-    last_wake=$(printf '%s' "$state" | jq -r --arg d "$id" '(.waking[$d] // 0) | if type == "number" then . else 0 end')
+    last_wake=$(last_wake_of "$id")
     if [ $((now - last_wake)) -ge "$WAKE_COOLDOWN_SECS" ]; then
         clear_wake_state "$id"
     fi
@@ -395,8 +405,8 @@ fi
 wake_list=""
 gave_up=""
 while IFS= read -r id; do
-    last_wake=$(printf '%s' "$state" | jq -r --arg d "$id" '(.waking[$d] // 0) | if type == "number" then . else 0 end')
-    wakes=$(printf '%s' "$state" | jq -r --arg d "$id" '(.wakes[$d] // 0) | if type == "number" then floor else 0 end')
+    last_wake=$(last_wake_of "$id")
+    wakes=$(printf '%s' "$state" | jq -r --arg d "$id" '(.wakes[$d] // 0) | if type == "number" then ([., 0] | max | [., 1000000] | min | floor) else 0 end')
     if [ $((now - last_wake)) -lt "$WAKE_COOLDOWN_SECS" ]; then
         continue  # a worker is already on it
     elif [ "$wakes" -ge "$MAX_CONSECUTIVE_WAKES" ]; then
