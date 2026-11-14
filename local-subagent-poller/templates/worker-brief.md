@@ -45,6 +45,10 @@
      {{ACTION_TOOLS}}      — the exact commands/tools for reading context
                               and acting (client invocations, API calls)
      {{WORKER_IDENTITY}}   — e.g. "the queue worker" / "the bot"
+     {{RESOLVE_MODE}}     — how your exit report resolves: "always"
+                            (report every run — the owner is waiting) or
+                            "on-unexpected" (default: report only ACTED /
+                            UNEXPECTED / FAILED; end ROUTINE runs silently)
      {{EXTRA_HARD_RULES}}  — source-specific hard rules (scopes, filters,
                               what never to do); delete the line if none
 -->
@@ -54,9 +58,8 @@ You are the **active tier** of a two-tier poller.
 A hook watches the queue file once a minute and wakes a replacement worker
 when an item arrives and no worker is alive; you are that worker's
 subagent. Stay awake while items are coming. **If no new task arrives for
-10 minutes, exit and report** (tasks processed, actions taken, items
-skipped with one-line reasons) — the hook will wake the next worker on the
-next item.
+10 minutes, exit** — see "Reporting (resolve)" for what to report and
+when — the hook will wake the next worker on the next item.
 
 {{IDENTITY}}
 
@@ -93,8 +96,10 @@ lock until you release it or stop touching the alive file for
 ```
 
 Exit 0 means you hold the lock. Exit 1 means another worker holds it —
-exit immediately and report it; do not process the queue. Exit 3 means
-`flock` is not installed — exit and report that. **On exit, release the
+exit without processing the queue; see "Reporting (resolve)"
+(UNEXPECTED: a wake fired while a worker was already alive). Exit 3
+means `flock` is not installed — exit; see "Reporting (resolve)"
+(FAILED: the environment is missing a dependency). **On exit, release the
 lock** (never `kill` the holder):
 `{{SCRIPTS_DIR}}/lock-holder.sh release --lock {{LOCKFILE}}`.
 `lock-holder.sh status --lock {{LOCKFILE}} --alive {{ALIVE_PATH}}` prints
@@ -112,9 +117,9 @@ large enough:
 Only run it while you hold the worker lock. It archives the queue, resets
 the cursor to 0 and prunes old archives.
 
-Check `{{STOP_FILE}}` every iteration. If it exists, exit and report:
-tasks processed, actions taken, items skipped (one line each on why), and
-where things stand.
+Check `{{STOP_FILE}}` every iteration. If it exists, exit — see
+"Reporting (resolve)": a stop-file exit is ROUTINE unless something
+failed, and the report says where things stand.
 
 ## Daemon health (liveness check)
 
@@ -127,6 +132,27 @@ where things stand.
 ## How to act
 
 {{ACTION_TOOLS}}
+
+## Reporting (resolve)
+
+Your exit report is a handoff-ready summary: tasks processed, actions
+taken, items skipped with one-line reasons — ending in a verdict line.
+The report carries task identifiers, counts and your one-line reasons —
+never quoted message text.
+
+How it resolves depends on {{RESOLVE_MODE}}:
+
+- `always` — report every run. Use it when the owner is waiting on this
+  poller (a test, a canary, a live session). Never end silently.
+- `on-unexpected` (default) — report only when the run was ACTED,
+  UNEXPECTED or FAILED: you did work, something surprised you, or
+  something failed. End a ROUTINE run silently: nothing new happened,
+  nothing needs the owner. Routine silence is the correct default, not a
+  bug — a quiet poller is a healthy poller.
+
+The verdict line is the last line of your report, exactly one of:
+`VERDICT: ACTED` / `VERDICT: UNEXPECTED` / `VERDICT: FAILED` /
+`VERDICT: ROUTINE`.
 
 ## Hard rules
 

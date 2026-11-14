@@ -112,7 +112,7 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 
 **Alternatives.** (a) A service with a credential-refreshing wrapper — rejected in that environment: there is no stable source for the wrapper to read. (b) Bake a long-lived credential into the unit — rejected: it would be a committed secret and would still expire.
 
-**Consequences.** In such environments, recovery after the host is replaced needs an agent-context mechanism (a recovery cron). The SDK documents the constraint, scoped to those environments, in the skill and in both daemon templates.
+**Consequences.** In such environments, recovery after the host is replaced needs an agent-context mechanism (a watchdog hook). The SDK documents the constraint, scoped to those environments, in the skill and in both daemon templates.
 
 ## ADR-12: Daemons are modules with a source adapter and a JSON config
 
@@ -143,3 +143,23 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 **Alternatives.** (a) Keep prose logs — rejected for the reasons above. (b) A logging library — rejected: the daemons are standard-library only.
 
 **Consequences.** Logs are filterable with `jq`. Anything that grepped the old prose lines must match on `event` names instead (for example `baseline`).
+
+## ADR-15: One watchdog supervises all daemons
+
+**Decision.** Daemon supervision is one hook (`daemon-watchdog.sh`, 60s poll) reading one registry (`daemon-registry.json`): one entry per daemon with its pgrep pattern, heartbeat file, stale threshold, stop file and start command. It wakes a worker only when a daemon is down, only once per cooldown per daemon, and never for a daemon whose stop file exists. The worker re-checks the stop file and `pgrep` immediately before starting.
+
+**Context.** A host replacement killed both production daemons silently (no traceback, no stop file) and cancelled a worker mid-task. The recovery in place was an hourly cron, which spends a full agent turn per check and takes up to an hour to notice an outage. A systemd service cannot be the recovery mechanism where credentials rotate per tool call (ADR-11). The production watchdog (one hook, two hard-coded daemons, 10-minute per-daemon cooldown) proved the shape twice in one day — a deliberate kill test and the real deployment — so the template generalizes it with a registry instead of hard-coding.
+
+**Alternatives.** (a) One watchdog hook per daemon — rejected: N hooks share no cooldown state and would double-wake for the same down daemon. (b) Keep the recovery cron — rejected: a full turn per check, up to an hour to notice. (c) Have the wake hook check the stop file and restart the daemon itself — rejected: the wake hook's job is waking workers for queue items, and a restart is a worker's job (it needs a fresh agent context to hold the credential).
+
+**Consequences.** The watchdog is the recovery mechanism; the hourly recovery cron is removed. The registry is the single list of supervised daemons — adding a daemon means adding an entry, not a hook. The registry carries the start commands (each entry's `start` field) and the worker brief for the watchdog (`watchdog-worker-brief.md`) tells the worker to read them from it, so the registry is owner-written config and the wake payload stays identifiers-only. The brief branches on the wake reason: a missing process is started once (never a second copy), a hung one (stale or missing heartbeat) is terminated, confirmed gone, then started. To keep a daemon that cannot recover (`error.json`: auth error or `max_failures`) from costing an agent turn every cooldown forever, the hook counts consecutive wakes per daemon in its state and goes silent with an explicit reason after `MAX_CONSECUTIVE_WAKES` (default 3, overridable); the count resets when the daemon is seen healthy or intentionally stopped.
+
+## ADR-16: Transparency is a decision at the resolve gate
+
+**Decision.** Every hook-spawned (Shape A) worker brief carries a RESOLVE instruction (`{{RESOLVE_MODE}}`: `always` / `on-unexpected`), and the worker's exit report ends in a verdict line (ACTED / UNEXPECTED / FAILED / ROUTINE). The poller hook prompt confirms the brief carries the instruction and resolves the verdict line: surface the report unless it is ROUTINE and the mode is `on-unexpected`. The watchdog worker resolves its own report the same way — its hook's prompt is the brief, so there is no separate spawner. Relayed handoffs go to one persistent side chat per poller, which posts them visibly and stays silent otherwise.
+
+**Context.** Two transparency probes looked like delivery failures and were not: the workers ran the check and chose silence because "daemons stopped as intended" is the expected state. The failure mode that is real is the opposite one — a handoff that arrives with a post request buried inside it is not followed, while a direct instruction to post is. The resolve decision therefore has to be explicit in two places (the brief names how the worker's report resolves; the hook prompt names how the spawner resolves the verdict), and the visible post has to go through one persistent side chat per poller.
+
+**Alternatives.** (a) Report every run — rejected: a quiet poller would spam the owner with "still fine" every time a worker exits. (b) Leave the resolve decision to the worker's judgment with no verdict line — rejected: the spawner then has no mechanical rule, and "should I surface this" becomes a judgment call made fresh every run. (c) Post directly from the worker — rejected: hook workers have no chat-send tool; the relay through main into a side chat is the deterministic route.
+
+**Consequences.** Routine silence is the correct default, not a bug. A poller whose owner is waiting (a test, a canary, a live session) sets `always`; everything else runs `on-unexpected`. The activity side chat is the feed the owner reads.
