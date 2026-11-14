@@ -28,7 +28,12 @@
      {{SCRIPTS_DIR}}       — absolute path to the directory holding
                               lock-holder.sh and rotate-queue.sh (copy them
                               from templates/ next to the brief)
-     {{STOP_FILE}}         — absolute path to the stop file
+     {{STOP_FILE}}         — absolute path to the WORKER's stop file
+                              (e.g. ~/hooks/state/<poller>-worker-stop).
+                              It must differ from the daemon's stop file
+                              (<state_root>/<stop_file_name> in the daemon
+                              config, the registry's `stop_file`): writing
+                              it stops the worker only, never the daemon.
      {{OWNER_ID}}          — the owner's verified author id in the source
                               (never a display name)
      {{LIVENESS_CHECK}}    — how to confirm the daemon is still alive:
@@ -117,7 +122,8 @@ large enough:
 Only run it while you hold the worker lock. It archives the queue, resets
 the cursor to 0 and prunes old archives.
 
-Check `{{STOP_FILE}}` every iteration. If it exists, exit — see
+Check `{{STOP_FILE}}` (the worker's stop file — never the daemon's)
+every iteration. If it exists, exit — see
 "Reporting (resolve)": a stop-file exit is ROUTINE unless something
 failed, and the report says where things stand.
 

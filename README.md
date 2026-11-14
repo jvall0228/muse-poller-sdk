@@ -8,7 +8,7 @@ Some work needs a reply in seconds when an external event happens: a player acts
 
 ## Two shapes, one core
 
-Both shapes share one core: the queue protocol, the worker lock, the alive and stop files, the daemon heartbeat, and the rate-limit rules, defined in [`docs/design.md`](docs/design.md).
+Both shapes share one core: the queue protocol, the worker lock, the alive file and the worker and daemon stop files, the daemon heartbeat, and the rate-limit rules, defined in [`docs/design.md`](docs/design.md).
 
 | Shape | When | How | Cost |
 |---|---|---|---|

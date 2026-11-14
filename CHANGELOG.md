@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.1 — 2026-11-14
+
+Template- and docs-only changes, like 1.0.2: pollers built from earlier versions need the same edits to benefit. No daemon, hook or watchdog code changed.
+
+### Fixed
+
+- **Worker and daemon stop files are different files (ADR-17).** Before 1.2.1 the skill, the design doc and the operator skill described one shared stop file for the daemon and the workers, so stopping a worker also stopped the daemon: on 2026-11-14 the fleet-queue worker was stopped by creating `~/hooks/state/fleet-queue-stop` and the daemon read the same path, logged `stop`, and exited with it (the watchdog correctly treated it as intentionally stopped until the file was removed, then restarted it). The worker's `{{STOP_FILE}}` is now `<state-dir>/<poller>-worker-stop` (stops workers only); the daemon's stop file (`<state_root>/<stop_file_name>`, the registry's `stop_file`, `<state-dir>/<poller>-stop`) is unchanged. Changed: the worker, router and slice-worker briefs, the watchdog worker brief, both skills, the design doc, the review guide and the instance inventory. Stopping everything means writing both files. Pollers built before 1.2.1 keep the shared path until their worker brief is re-filled with the `-worker-stop` path.
+
 ## 1.2.0 — 2026-11-13
 
 One watchdog supervises all daemons, and transparency is a decision at the resolve gate.

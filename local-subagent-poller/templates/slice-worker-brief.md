@@ -33,7 +33,13 @@
                               a locked choice."
      {{SCRIPTS_DIR}}        — absolute path to the directory holding
                               rotate-queue.sh (copy it from templates/)
-     {{STOP_FILE}}          — absolute path to the stop file
+     {{STOP_FILE}}          — absolute path to the WORKER's stop file
+                              (e.g. ~/hooks/state/<poller>-worker-stop).
+                              It must differ from the daemon's stop file
+                              where one exists (Shape B normally has no
+                              daemon; if one is added, the two paths must
+                              differ): writing it stops this worker only,
+                              never the daemon.
      {{OWNER_ID}}           — the owner's verified author id in the source
                               (never a display name)
      {{REPORT_FIELDS}}      — what to report on stop, e.g. "tasks processed,
@@ -54,7 +60,7 @@ You are the {{SLICE_WORKER_TITLE}}. Consume {{QUEUE_PATH}} {{WORKER_POLL}} (trac
 
 {{SLICE_RULES}}
 
-**Stop when {{STOP_FILE}} exists.** There is no idle exit — you stay warm for the session. On stop, report: {{REPORT_FIELDS}}.
+**Stop when the worker stop file ({{STOP_FILE}}) exists.** There is no idle exit — you stay warm for the session. On stop, report: {{REPORT_FIELDS}}.
 
 ## How to act
 

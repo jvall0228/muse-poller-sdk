@@ -3,6 +3,12 @@
 The three live implementations the templates were extracted from. When a
 template line is questioned, trace it here first.
 
+Stop files (1.2.1, ADR-17): each two-tier instance has two — a worker stop
+file (`<state-dir>/<poller>-worker-stop`) and a daemon stop file
+(`<state-dir>/<poller>-stop`). Instance 2 still lists the pre-1.2.1 shared
+path; instance 3 lists the split paths. Instance 1 (Shape B) has no
+daemon, so its stop file is the worker stop file.
+
 ## 1. Live game session — Shape B orchestrator (origin, Nov 12)
 
 - **Shape:** router (orchestrator) + 4 slice workers (narrator, combat,
@@ -21,7 +27,7 @@ template line is questioned, trace it here first.
   scribe at 15s is the outlier: it is *slower* than its producers
   (narrator/combat hand off at any time), so it can lag a dispatch by
   up to 15s. Do not copy the 15s rate without that latency cost.
-- **Stop file:** `<state-dir>/orchestrator-stop`.
+- **Stop file (worker — Shape B has no daemon):** `<state-dir>/orchestrator-stop`. (No `-worker-` infix — the name predates the 1.2.1 naming; it is the worker stop file and there is no daemon to collide with.)
 - **Skill:** a project-specific orchestrator skill (full worker briefs + routing table).
 - **Verified:** session 2, 6 tasks routed, no errors, no double-handling.
 - **Why it exists:** hooks take minutes per reply, crons floor at 1 min —
@@ -46,7 +52,8 @@ template line is questioned, trace it here first.
   Polls the queue every 10s (matches the daemon). Liveness check ~every
   2 min (watcher process + `last-seen.json` freshness).
 - **State:** `<state-dir>/mentions/` (`mentions.jsonl`,
-  `mentions.cursor`, `last-seen.json`). Stop file:
+  `mentions.cursor`, `last-seen.json`). Stop file (pre-1.2.1 shared path —
+  worker and daemon both read it; see ADR-17):
   `<state-dir>/mentions-stop`.
 - **Measured:** warm reply ~23s end-to-end (a test mention from a server
   member, Nov 13 11:22 EST). Cold-start test pending (owner's two test mentions).
@@ -76,7 +83,8 @@ template line is questioned, trace it here first.
   the team-queue brief has no daemon-health liveness check — the SDK templates
   it as required; the production brief should gain one on its next edit.
 - **State:** `<state-dir>/team-queue/` (`queue.jsonl`, `queue.cursor`,
-  `last-seen.json`). Stop file: `<state-dir>/team-queue-stop`.
+  `last-seen.json`). Stop files: daemon `<state-dir>/team-queue-stop`;
+  worker `<state-dir>/team-queue-worker-stop` (split in 1.2.1).
 - **Measured (Nov 13):** second canary, clean run — post → reply 4m 35s,
   wake → reply 3m 42s; daemon 18s, hook 35s. First canary — wake → reply
   3m 7s (end-to-end 14m 32s only because the baseline bug held it ~11 min).
@@ -109,13 +117,13 @@ template line is questioned, trace it here first.
   threshold; the template reads `polled_at` instead (the 1.1.0 rule: a
   file's mtime is never a liveness signal — an idle daemon whose state
   file only updates on new items looks dead).
-- **Stop files:** a daemon whose stop file exists is intentionally stopped
+- **Stop files (daemon):** a daemon whose daemon stop file exists is intentionally stopped
   and skipped (`<state-dir>/team-queue-stop`,
   `<state-dir>/chat-mentions-stop`). The production log once called a
   stopped daemon "healthy"; the template logs it as intentionally
   stopped.
 - **Cooldown:** 10 minutes per daemon after a wake, so a worker restarting
-  a daemon is not double-woken. The worker re-checks the stop file and
+  a daemon is not double-woken. The worker re-checks the daemon stop file and
   `pgrep` before starting.
 - **Measured:** proven twice the same day — a deliberate kill test, and a
   real host replacement (~17:58) that killed both daemons silently; the

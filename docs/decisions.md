@@ -4,7 +4,9 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 
 ## ADR-1: Two shapes on one core, not one shape
 
-**Decision.** The SDK carries two shapes — Shape A (two-tier poller) and Shape B (orchestrator) — sharing one core (queue protocol, alive file, worker lock, stop file, rate-limit rules, daemon heartbeat).
+**Decision.** The SDK carries two shapes — Shape A (two-tier poller) and Shape B (orchestrator) — sharing one core (queue protocol, alive file, worker lock, worker and daemon stop files, rate-limit rules, daemon heartbeat).
+
+**Amended in 1.2.1 (see ADR-17).** "Stop file" in the shared core is now two files: the worker's `{{STOP_FILE}}` and the daemon's stop file, never the same path.
 
 **Context.** The pattern started as always-warm workers for live game play (Nov 12). The two-tier form was built the next day for intermittent work (chat mentions, team chat queue). The two forms share the queue protocol and the worker loop but differ in wake-up, lifetime, and routing.
 
@@ -146,7 +148,7 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 
 ## ADR-15: One watchdog supervises all daemons
 
-**Decision.** Daemon supervision is one hook (`daemon-watchdog.sh`, 60s poll) reading one registry (`daemon-registry.json`): one entry per daemon with its pgrep pattern, heartbeat file, stale threshold, stop file and start command. It wakes a worker only when a daemon is down, only once per cooldown per daemon, and never for a daemon whose stop file exists. The worker re-checks the stop file and `pgrep` immediately before starting.
+**Decision.** Daemon supervision is one hook (`daemon-watchdog.sh`, 60s poll) reading one registry (`daemon-registry.json`): one entry per daemon with its pgrep pattern, heartbeat file, stale threshold, daemon stop file and start command. It wakes a worker only when a daemon is down, only once per cooldown per daemon, and never for a daemon whose daemon stop file exists. The worker re-checks the daemon stop file and `pgrep` immediately before starting.
 
 **Context.** A host replacement killed both production daemons silently (no traceback, no stop file) and cancelled a worker mid-task. The recovery in place was an hourly cron, which spends a full agent turn per check and takes up to an hour to notice an outage. A systemd service cannot be the recovery mechanism where credentials rotate per tool call (ADR-11). The production watchdog (one hook, two hard-coded daemons, 10-minute per-daemon cooldown) proved the shape twice in one day — a deliberate kill test and the real deployment — so the template generalizes it with a registry instead of hard-coding.
 
@@ -163,3 +165,13 @@ Architecture Decision Records for the Subagent Poller SDK. Each entry: the decis
 **Alternatives.** (a) Report every run — rejected: a quiet poller would spam the owner with "still fine" every time a worker exits. (b) Leave the resolve decision to the worker's judgment with no verdict line — rejected: the spawner then has no mechanical rule, and "should I surface this" becomes a judgment call made fresh every run. (c) Post directly from the worker — rejected: hook workers have no chat-send tool; the relay through main into a side chat is the deterministic route.
 
 **Consequences.** Routine silence is the correct default, not a bug. A poller whose owner is waiting (a test, a canary, a live session) sets `always`; everything else runs `on-unexpected`. The activity side chat is the feed the owner reads.
+
+## ADR-17: Worker and daemon stop files are different files
+
+**Decision.** A poller has two stop files, never one shared path. The worker's `{{STOP_FILE}}` is `<state-dir>/<poller>-worker-stop`; the daemon's stop file is `<state_root>/<stop_file_name>` in the daemon config (the registry's `stop_file`), conventionally `<state-dir>/<poller>-stop`. Writing the worker stop file stops workers only; writing the daemon stop file stops the daemon (and tells the watchdog it was intentional). Stopping everything means writing both.
+
+**Context.** Before 1.2.1 the skill, the design doc ("Stop file" in "The shared core") and the operator skill all described one stop file that stopped the daemon and the workers. On 2026-11-14 the fleet-queue worker was stopped by creating `~/hooks/state/fleet-queue-stop` — the path the worker brief and the daemon config both named — and the daemon read the same path, logged `stop`, and exited with it. The watchdog then correctly treated the daemon as intentionally stopped until the file was removed, and restarted it once it was gone. The outage was ~4 minutes (daemon down 14:23–14:26 UTC) and the recovery worked as designed; the defect was the shared path, not the watchdog.
+
+**Alternatives.** (a) Keep one shared file and document that stopping the worker also stops the daemon — rejected: the two are stopped for different reasons at different times (a redundant worker is stopped often; the daemon almost never), and a shared path makes the common operation kill the daemon. (b) Rename the daemon's path and keep the worker's — rejected: the daemon reads its stop path from its config at startup, so renaming it needs a daemon restart and a registry change, while renaming the worker's path needs only a brief edit (the next worker briefed uses it). (c) Have the daemon ignore a stop file created while a worker is alive — rejected: the daemon cannot know why the file appeared, and the file is the operator's word.
+
+**Consequences.** The worker briefs, the skill, the operator skill, the design doc and the review guide name the two files separately, and the review guide's template-fidelity check confirms a scaffolded poller's worker `{{STOP_FILE}}` differs from its daemon stop file. Pollers built before 1.2.1 keep the shared path until their worker brief is re-filled with the `-worker-stop` path; the daemon's path does not change. The fleet-queue live instance migrates its worker brief to `fleet-queue-worker-stop` (daemon path unchanged); a worker briefed before the migration still stops on the old path until it exits.

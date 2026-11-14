@@ -23,7 +23,8 @@ Both shapes have the same pieces; what each is and how it works is defined in `d
 | Queue, `.cursor`, `queue.lock`, archives | `~/hooks/state/<poller>/` (queue archives are `queue.<UTC timestamp>.jsonl`) |
 | Worker lock and alive file | `~/hooks/state/<poller>/worker.lock`, `worker-alive` |
 | Heartbeat and markers | `last-seen.json`, `error.json`, `channel-warning.json` in the state dir |
-| Stop file | `~/hooks/state/<poller>-stop` |
+| Worker stop file | `~/hooks/state/<poller>-worker-stop` — stops workers only; the daemon keeps polling |
+| Daemon stop file | `~/hooks/state/<poller>-stop` — stops the daemon; must equal `<state_root>/<stop_file_name>` in the daemon config and the registry's `stop_file` |
 | Watchdog | `~/hooks/scripts/daemon-watchdog.sh`, registered with `hooks.add` (60s poll); registry `~/hooks/state/daemon-registry.json` |
 | Activity side chat | One persistent side chat per poller; relayed handoffs land there, posted visibly |
 | High-water mark | `last-seen.json` (Shape A) or `last-dispatched-seq.txt` (Shape B) |
@@ -49,8 +50,11 @@ Run this whenever replies stop or before a session:
 
 ## Workflow — stop and resume
 
-- **Stop:** write the stop file. The daemon and all workers exit on their next loop check and report. For Shape A, also disable the hook — the hook does not check the stop file, so if items are queued when it is touched, it still wakes a worker that exits immediately (one wasted cold start). The watchdog DOES check the stop file, so it will not wake a worker for a stopped daemon — leave it enabled.
-- **Resume:** delete the stop file. Shape A: re-enable the hook and restart the daemon the way it was started (start location rule: the SDK skill, "Operating rules"). If a watchdog hook is registered and the daemon is dead, the watchdog restarts it on its next poll — or restart it yourself the way it was started. The daemon resumes from `last-seen.json` — no re-baseline, no lost items. Shape B: re-spawn all workers with fresh briefs; the router starts from the high-water mark and will not re-dispatch old events, and slice workers resume from their `.cursor` files.
+- **Stop the workers only:** write the worker stop file (`~/hooks/state/<poller>-worker-stop`). The workers exit on their next loop check and report; the daemon keeps polling and the queue keeps filling. The hook does not check either stop file, so for Shape A also disable the hook — otherwise, if items are queued when it is touched, it still wakes a worker that exits immediately (one wasted cold start).
+- **Stop the daemon only:** write the daemon stop file (`~/hooks/state/<poller>-stop`). The daemon exits on its next loop check. The watchdog DOES check the daemon stop file, so it will not wake a worker for a stopped daemon — leave it enabled. Workers already running keep draining the queue, then exit after 10 minutes quiet; no new items arrive while the daemon is down.
+- **Stop everything:** disable the hook first (Shape A), then write both stop files. The order matters: if the worker stop file lands while the hook is still enabled, the hook wakes a worker that exits immediately on it (one wasted cold start).
+- **Never write one shared path for both.** Before 1.2.1 the two stop files were the same path, so stopping a worker also killed the daemon (2026-11-14: a redundant fleet-queue worker was stopped and the daemon exited with it). If you find a poller where the worker's `{{STOP_FILE}}` equals the daemon's stop file, give the worker the `-worker-stop` path first — the daemon's path stays as it is.
+- **Resume:** delete the stop file(s) you wrote. Shape A: re-enable the hook (if disabled) and restart the daemon the way it was started (start location rule: the SDK skill, "Operating rules") — if only the worker stop file was written, the daemon never stopped and there is nothing to restart. If a watchdog hook is registered and the daemon is dead, the watchdog restarts it on its next poll — or restart it yourself the way it was started. The daemon resumes from `last-seen.json` — no re-baseline, no lost items. Shape B: re-spawn all workers with fresh briefs; the router starts from the high-water mark and will not re-dispatch old events, and slice workers resume from their `.cursor` files. After resuming, verify both stop files are absent, the daemon process is alive with `polled_at` fresh, and (Shape A) the hook is re-enabled — a leftover stop file leaves the poller half-stopped (a leftover worker stop file wakes workers that exit at once; a leftover daemon stop file leaves the queue frozen).
 
 ## Operating rules
 
@@ -77,5 +81,5 @@ If the source, the routing table, the decision rules, or the poll rates change, 
 
 When operating a poller, produce:
 - A health verdict from the three checks above (daemon, cursor, lock and alive file) with the numbers, not a feeling.
-- For a stop/resume: the stop file written (or deleted), the hook disabled (or re-enabled), and the workers' exit reports collected.
+- For a stop/resume: which stop file was written (or deleted) — worker, daemon, or both — the hook disabled (or re-enabled), and the workers' exit reports collected.
 - For a stall: the item(s) covered manually, the cause found, and the fix applied — or the scaffold change named if the fix belongs in the SDK skill.
