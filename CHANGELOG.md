@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.0 — 2026-11-14
+
+The public skill copies catch up with the live pollers: native Muse skill format, the side-chat-agent worker shape (ADR-18), and the 1.1.0/1.2.1 work that had only lived locally — merged with the upstream flock/rotation discipline preserved, not overwritten.
+
+### Added
+
+- **Native Muse skill format for both poller skills.** `SKILL.md` no longer carries YAML frontmatter (it starts with `# Title` and stays under 250 lines), and each skill gains a `skill.yaml` (`name`, `title`, `description`, `category`, `include_in_prompt`, `availability`). Each skill's `README.md` gains an **Installation** section: copy the skill to `~/workspace/skills/` (the copy the harness loads) and mirror it to `~/workspace/custom-skills/`, keeping the two byte-identical. Prompt-only skills carry no `wisp.yaml`.
+- **Side-chat-agent pattern (ADR-18).** The Shape A worker is a side chat agent living in the poller's dedicated side chat, not a fresh subagent spawned per wake. The hook (60s) hands off to main when new work exists — it does not spawn a subagent and does not act itself. Main wakes the side chat agent in the poller's side chat. The agent consumes the queue file itself (poll interval matching the daemon), acts on items under its brief, touches the alive file each iteration, exits after 10 minutes quiet, and reports as its final message in that chat. The worker brief lives in the chat as a message — the chat brief is the source of truth; a file copy of the brief is a superseded fallback. The same shape replaces the warm slice workers in Shape B: the side chat agent takes on the orchestrator role and does all orchestrator work itself (classify, dispatch, act). Proven live on fleet-queue, Discord mentions, and the Varisia table.
+- **README architecture section.** The README now leads with diagrams (mermaid) of the system map, both shapes, the queue protocol, the watchdog, the stop-file split, the resolve gate, the state files, and the measured latencies — so the architecture is understandable from the README alone.
+
+### Changed
+
+- **Public skill copies synced to 1.1.0 and 1.2.1.** The 1.1.0 restructure (config-file daemons with source adapters, `lock-holder.sh` and `rotate-queue.sh`, JSON-lines logs) and the 1.2.1 stop-file split (worker stop `<poller>-worker-stop`, daemon stop `<poller>-stop`) are now in the public copies, which had lagged the local ones.
+- **Upstream flock/rotation discipline preserved in the merge.** The sync was a two-way merge, not a verbatim copy: the hook reads line count and cursor under a non-blocking shared `flock` on `queue.lock`; every producer appends under `flock -x queue.lock`; `rotate-queue.sh` archives a fully consumed queue and resets the cursor to 0; `cursor > lines` (or a non-numeric cursor) means the queue was rotated and is treated as 0. The local copies gained the same discipline.
+
+### Fixed
+
+- **Public example configs and registry carried real deployment identifiers — replaced with generic placeholders.** The sync initially copied the local skills' real values into the public repo (Slack channel/bot IDs, Discord channel/bot IDs, internal ticket keys in the example configs, the example registry, `SKILL.md` and `references/instances.md`), which the leak check flags. The public copies now use the generic placeholders (`team-queue` / `bot-user-id` / `example-poller` / `example-mentions`); the local copies keep the real values by design (ADR-7). `scripts/check-leaks.sh` is clean on the public copy.
+- **Hook tests failed on the synced example registry.** The synced `daemon-registry.example.json` carried the real fleet-queue and Discord entries, but the hook tests read `.daemons[0].pgrep` from the example registry and check it matches the generic `example-poller/daemon.py` pattern. Restored the generic example registry; hook tests pass 261/261.
+
 ## 1.2.1 — 2026-11-14
 
 Template- and docs-only changes, like 1.0.2: pollers built from earlier versions need the same edits to benefit. No daemon, hook or watchdog code changed.
