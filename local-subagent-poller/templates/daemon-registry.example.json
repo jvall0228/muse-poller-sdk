@@ -1,0 +1,24 @@
+{
+    "daemons": [
+        {
+            "heartbeat_field": "polled_at",
+            "heartbeat_file": "~/hooks/state/example-poller/last-seen.json",
+            "id": "example-poller",
+            "pgrep": "^python3 .*/example-poller/watcher.py$",
+            "stale_secs": 180,
+            "start": "setsid nohup python3 ~/workspace/example-poller/watcher.py >> ~/hooks/logs/example-poller-watcher.log 2>&1 < /dev/null &",
+            "stop_file": "~/hooks/state/example-poller-stop",
+            "verify": "polled_at advancing in ~/hooks/state/example-poller/last-seen.json"
+        },
+        {
+            "heartbeat_field": "polled_at",
+            "heartbeat_file": "~/hooks/state/example-mentions/last-seen.json",
+            "id": "example-mentions",
+            "pgrep": "^bun .*/example-mentions/watcher.ts$",
+            "stale_secs": 30,
+            "start": "setsid nohup bun ~/workspace/example-mentions/watcher.ts >> ~/hooks/logs/example-mentions-watcher.log 2>&1 < /dev/null &",
+            "stop_file": "~/hooks/state/example-mentions-stop",
+            "verify": "polled_at advancing in ~/hooks/state/example-mentions/last-seen.json"
+        }
+    ]
+}
