@@ -33,7 +33,7 @@ A subagent with no context of the build decisions — just the original request,
 - **N4 — Wake-latency bound understated the path.** "Hook wake latency: ≤60s" omitted the daemon's ≤60s. Now "post → wake ≤120s (daemon ≤60s + hook ≤60s)."
 - **N5 — Overclaim.** "The templates are the production files" — the worker brief is a synthesis and the daemon template is extracted from one instance only. Now "the templates are extracted from the production files."
 - **N6 — Placeholder ergonomics.** `{{LIVENESS_CHECK}}` now has a section header; the placeholder definitions moved to the top of the worker-brief template; `{{POLL_SECS}}` is documented as a bare integer (not `"60s"`).
-- **N7 — Stop-file + hook interaction undocumented.** The hook does not check the stop file, so a wake after the stop file is touched spawns a worker that exits immediately. Documented in the skill's pieces table.
+- **N7 — Stop-file + hook interaction undocumented.** The hook does not check either stop file, so a wake after the worker stop file is touched spawns a worker that exits immediately. Documented in the skill's pieces table.
 - **N8 — Discord backoff effectively unreachable + dead imports.** Per-channel errors were caught inside `pollOnce`, so the outer backoff only fired on whole-cycle failures — documented in the instances file and the TS template. The dead imports (`subprocess`, `sys`) were removed from the Python template. (The backoff part was superseded in 1.0.1: per-channel failures are now counted, and an all-channels-failed cycle is a cycle failure — see the second review below.)
 
 ## Second review (PR 1, Nov 13)
