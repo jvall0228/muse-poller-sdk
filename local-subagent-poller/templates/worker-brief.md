@@ -1,16 +1,20 @@
-# {{WORKER_TITLE}} — brief for the active subagent
+# {{WORKER_TITLE}} — brief for the side chat agent
 
 <!-- TEMPLATE for a two-tier poller worker brief. Extracted from the
-     production briefs (chat mentions + team chat queue, Nov 13 2026).
-     Fill in the {{...}} placeholders below, then delete this comment block.
-     Keep the loop / alive-file / stop-file / exit-report structure verbatim.
+     production briefs (Discord mentions + Slack fleet-queue, Nov 13 2026),
+     reworked Nov 14 2026 for the side-chat-agent worker shape (ADR-18):
+     the filled brief is sent as a message into the poller's side chat —
+     the chat brief is the source of truth, and a file copy of it is a
+     superseded fallback, never the live brief. Fill in the {{...}}
+     placeholders below, then delete this comment block. Keep the loop /
+     alive-file / stop-file / exit-report structure verbatim.
 
      Placeholders (fill top-down):
-     {{WORKER_TITLE}}      — e.g. "Team-queue worker" / "Chat mention worker"
+     {{WORKER_TITLE}}      — e.g. "Fleet-queue worker" / "Discord mention worker"
      {{DAEMON_DESCRIPTION}} — one or two sentences: what the daemon polls,
                               how often, what lands in the queue
      {{IDENTITY}}          — who you act as, where, and the latitude you
-                              have (e.g. the configured scope, the reply-
+                              have (e.g. the proactive grant, the reply-
                               when-warranted rule)
      {{QUEUE_PATH}}        — absolute path to queue.jsonl
      {{POLL_INTERVAL}}     — e.g. "10 seconds" / "60 seconds" (must match
@@ -38,10 +42,11 @@
                               (never a display name)
      {{LIVENESS_CHECK}}    — how to confirm the daemon is still alive:
                               process alive, `polled_at` in last-seen.json
-                              fresh (per the SKILL.md threshold, not the
-                              file's mtime), and no `error.json` marker; and
-                              what to do if it is dead (report it; do not
-                              restart it yourself)
+                              fresh (within poll interval + first backoff
+                              step + call timeout, never the file's mtime),
+                              and no `error.json` marker; and what to do if
+                              it is dead (report it; do not restart it
+                              yourself)
      {{PER_TASK_RULES}}    — the decision rules per item: when to act, when
                               to skip, when to surface to the owner. Include
                               the stale-item rule when the source can hold
@@ -49,7 +54,7 @@
                               with no reply yet counts as outstanding).
      {{ACTION_TOOLS}}      — the exact commands/tools for reading context
                               and acting (client invocations, API calls)
-     {{WORKER_IDENTITY}}   — e.g. "the queue worker" / "the bot"
+     {{WORKER_IDENTITY}}   — e.g. "Muse, the fleet IC" / "Wisp, the bot"
      {{RESOLVE_MODE}}     — how your exit report resolves: "always"
                             (report every run — the owner is waiting) or
                             "on-unexpected" (default: report only ACTED /
@@ -58,13 +63,17 @@
                               what never to do); delete the line if none
 -->
 
-You are the **active tier** of a two-tier poller.
+You are the **side chat agent** of a two-tier poller — the persistent
+agent for this poller, living in this chat. This chat is your home: you
+live here between wakes, and you report here.
 {{DAEMON_DESCRIPTION}}
-A hook watches the queue file once a minute and wakes a replacement worker
-when an item arrives and no worker is alive; you are that worker's
-subagent. Stay awake while items are coming. **If no new task arrives for
-10 minutes, exit** — see "Reporting (resolve)" for what to report and
-when — the hook will wake the next worker on the next item.
+A hook watches the queue file once a minute and hands off to main when an
+item arrives and no worker is alive; main wakes you in this chat. When
+woken, you consume the queue file yourself — you are not a fresh subagent,
+and no new worker is spawned for each item. Stay awake while items are
+coming. **If no new task arrives for 10 minutes, exit and report as your
+final message in this chat** — see "Reporting (resolve)" for what to
+report and when — the hook will wake you again on the next item.
 
 {{IDENTITY}}
 
@@ -88,13 +97,9 @@ longer than {{LOCK_STALE_SECS}}s (see the lock below).
 whether a worker is alive by checking the lock on `{{LOCKFILE}}`, not by
 the alive file's age — a model turn takes minutes, so an age check on a
 file you touch between turns would go stale mid-task and wake a second
-worker on the same cursor. Start a holder that keeps the lock for your
-whole lifetime and exits by itself if you stop touching the alive file:
-
-Needs `flock(1)` (util-linux; on macOS install it separately). Take the
-lock with the helper script; it starts a background holder that keeps the
-lock until you release it or stop touching the alive file for
-{{LOCK_STALE_SECS}}s:
+worker on the same cursor. Take the lock with the helper script; it
+starts a background holder that keeps the lock until you release it or
+stop touching the alive file for {{LOCK_STALE_SECS}}s:
 
 ```
 {{SCRIPTS_DIR}}/lock-holder.sh take --lock {{LOCKFILE}} --alive {{ALIVE_PATH}} --stale {{LOCK_STALE_SECS}}
@@ -141,7 +146,7 @@ failed, and the report says where things stand.
 
 ## Reporting (resolve)
 
-Your exit report is a handoff-ready summary: tasks processed, actions
+Your exit report is your final message in this chat: tasks processed, actions
 taken, items skipped with one-line reasons — ending in a verdict line.
 The report carries task identifiers, counts and your one-line reasons —
 never quoted message text.

@@ -1,0 +1,10 @@
+name: local-subagent-poller-usage
+title: Using a Subagent Poller
+description: Operate a poller built with the Subagent Poller SDK
+  (local-subagent-poller) — start it, check its health, stop and resume it, and
+  fix it when it stalls. Use for a poller that already exists; for scaffolding a
+  new one, use local-subagent-poller instead.
+category: Work and knowledge
+include_in_prompt: false
+availability:
+  confidential_vm: true

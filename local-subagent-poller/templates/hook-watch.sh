@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # hook-watch.sh — TEMPLATE for a two-tier poller wake hook.
-# Extracted from production hooks (chat mentions + team chat queue,
+# Extracted from the production hooks (Discord mentions + Slack fleet-queue,
 # Nov 13 2026). Copy this file into the new poller's hooks directory and fill
 # in the {{...}} placeholders. Keep the structure verbatim — the seen_absent
 # rule, the worker-lock rule, and the cursor-based outstanding rule are
@@ -41,7 +41,7 @@
 #   {{PAYLOAD_KEY}}   — payload key for the count, e.g. "new_items" / "new_mentions"
 #   {{NO_FILE_REASON}} — silent reason when the queue file is absent, e.g.
 #                       "no queue file yet" / "no mentions queue yet"
-#   {{WAKE_REASON}}   — wake reason, e.g. "new team-queue item(s), no worker alive"
+#   {{WAKE_REASON}}   — wake reason, e.g. "new fleet-queue item(s), no worker alive"
 #   {{TASK_JQ}}       — jq filter extracting IDENTIFIERS ONLY from the last
 #                       queue line, e.g. '{ts, thread_ts}' or
 #                       '{message_id, channel_id}'. Never include message
